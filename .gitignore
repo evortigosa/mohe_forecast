@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+.env/
+.env.* 
+.venv/
+
+# Jupyter
+.ipynb_checkpoints
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Data and models (do not commit heavy data or models)
+data/
+models/
+*.ckpt
+*.pt
+*.pth
+
+# Packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log

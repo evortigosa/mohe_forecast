@@ -1,0 +1,9 @@
+einops==0.8.1
+matplotlib==3.10.0
+numpy==2.0.2
+pandas==2.2.2
+scikit-learn==1.6.1
+timm==1.0.20
+torch==2.8.0
+tqdm==4.67.1
+datasetsforecast==1.0.0
