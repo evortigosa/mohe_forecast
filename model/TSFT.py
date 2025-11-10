@@ -379,7 +379,7 @@ class OutputBlock(nn.Module):
         # in fine_tune mode we have only a simplified projection head -- see ViT
         if fine_tune:
             if ffn_type== 'fan':
-                self.out_proj= FANLayer(d_model, n_outputs, bias=bias)
+                self.out_proj= FANLayer(d_model, n_outputs, bias=bias, is_last=True)
             else:
                 self.out_proj= nn.Linear(d_model, n_outputs, bias=bias)
 

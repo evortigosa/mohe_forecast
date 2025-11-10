@@ -65,7 +65,8 @@ PatchTST (https://github.com/yuqinie98/PatchTST)
 U-ViT (https://github.com/baofff/U-ViT)
 
 ## Contact
-Please let us know if you have any suggestions or find out a mistake: evandro.scudeleti-ortigossa@weizmann.ac.il or eran.segal@weizmann.ac.il or submit an issue.
+Please let us know if you have any suggestions or find out a mistake: 
+evandro.scudeleti-ortigossa@weizmann.ac.il or eran.segal@weizmann.ac.il or submit an issue.
 
 ## License
 This project is licensed under the Apache-2.0 License.

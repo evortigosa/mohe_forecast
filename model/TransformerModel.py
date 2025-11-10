@@ -72,6 +72,9 @@ class QKRoPE(nn.Module):
 
 
     def forward(self, q, k, start_pos, inference):
+        if self.theta <= 0.:
+            return q, k
+
         B, T, _, _= q.shape  # shape (B, T, nh, dh)
 
         if inference:
@@ -638,10 +641,11 @@ class FANLayer(nn.Module):
     gate=False, the FANLayer omits that scalar gate and simply concatenates cos(p), sin(p), and a
     non‐periodic transform.
     - freq_scale (float) multiplies the std of Wp to set the bandwidth (higher -> higher freq).
-    - Defined in https://arxiv.org/abs/2410.02675
+    - Adapted from https://arxiv.org/abs/2410.02675
     """
 
-    def __init__(self, input_dim, output_dim, gate=False, bias=False, freq_scale=1.0) -> None:
+    def __init__(self, input_dim, output_dim, gate=False, bias=False, freq_scale=1.0,
+                 is_last=False) -> None:
         super(FANLayer, self).__init__()
         assert output_dim % 4 == 0, "output_dim must be divisible by 4"
         # p_output_dim is set to a quarter of output_dim as in the original paper
@@ -651,10 +655,10 @@ class FANLayer(nn.Module):
         self.Wp= nn.Linear(input_dim, p_output_dim, bias=bias)
         if gate:
             self.gate= nn.Parameter(torch.zeros(1))
-            self.actv_fn= nn.SiLU()
+            self.actv_fn= nn.SiLU() if not is_last else nn.Identity()
         else:
             self.gate= None
-            self.actv_fn= nn.GELU()
+            self.actv_fn= nn.GELU() if not is_last else nn.Identity()
         # For the non-periodic component
         self.Wp_bar= nn.Linear(input_dim, p_bar_output_dim, bias=bias)
 
@@ -702,7 +706,7 @@ class FANFeedForward(nn.Module):
         # FAN down layer
         self.down_fan= FANLayer(d_ff, d_model, fan_gate, bias=bias, freq_scale=freq_scale)
         # Final projection when n_outputs is not None
-        if n_outputs is not None and n_outputs != d_model:
+        if (n_outputs is not None) and (n_outputs != d_model):
             self.WL= nn.Linear(d_model, n_outputs, bias=bias)
             # initialize the Linear module with Glorot / fan_avg
             nn.init.xavier_uniform_(self.WL.weight)

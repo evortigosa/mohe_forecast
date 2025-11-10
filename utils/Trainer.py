@@ -19,9 +19,12 @@ from tqdm import tqdm
 class Trainer:
     """
     Trainer class for training the model.
+    - train_loader, val_loader, test_loader are DataLoader objects with train, val, test data.
+    - train_ds_scaler is a sklearn StandardScaler from train_loader.
     - scheduler (optional): a per-step learning rate scheduler (not per epoch).
     - early_stopping (optional): early stopping utility.
-    - TODO: switch raw prints by logging.
+    - use_time_features (optional): whether to use time covariates.
+    - TODO: switch raw prints by loggings.
     """
 
     def __init__(self, model, device, train_loader, train_ds_scaler, val_loader, test_loader,
@@ -417,7 +420,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
         try:
-            checkpoint= torch.load(checkpoint_path, map_location=self.device)
+            checkpoint= torch.load(checkpoint_path, map_location='cpu')
             if 'config' not in checkpoint:
                 raise KeyError("Checkpoint does not contain a 'config' key to build the model")
 
