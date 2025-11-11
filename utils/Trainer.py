@@ -52,9 +52,8 @@ class Trainer:
         self.train_losses= []
         self.val_losses= []
         self.lr_hist= []
-        # train_ds_scaler normalization info
-        self.scale_= torch.from_numpy(train_ds_scaler.scale_).float().view(1,-1,1).to(self.device)
-        self.mean_ = torch.from_numpy(train_ds_scaler.mean_).float().view(1,-1,1).to(self.device)
+        # train_ds_scaler for denormalization
+        self.train_ds_scaler= train_ds_scaler
 
 
     def train_one_epoch(self, epoch):
@@ -290,6 +289,13 @@ class Trainer:
         test_loader= self.test_loader if test_loader is None else test_loader
         assert test_loader is not None, "test_loader cannot refer to None"
 
+        if self.train_ds_scaler is not None:
+            inverse_transform= inverse_transform
+            scale_= torch.from_numpy(self.train_ds_scaler.scale_).float().view(1, -1, 1).to(self.device)
+            mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1, -1, 1).to(self.device)
+        else:
+            inverse_transform= False
+
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -317,8 +323,8 @@ class Trainer:
                     logits= self.model.forecast(data, ts_mark=data_time, ts_mark_future=target_time)
                     if inverse_transform:
                         # invert the scaling back to the original units
-                        logits= logits * self.scale_ + self.mean_
-                        target= target * self.scale_ + self.mean_
+                        logits= logits * scale_ + mean_
+                        target= target * scale_ + mean_
                 else:
                     logits, _= self.model(data, ts_mark=data_time)
                 losses= test_criterion(logits, target)
