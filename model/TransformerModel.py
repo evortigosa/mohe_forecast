@@ -871,7 +871,7 @@ class TransformerBlock(nn.Module):
                  ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
                  bias=False, rope_theta=10000.0) -> None:
         super(TransformerBlock, self).__init__()
-        self.multi_modal= multi_modal
+
         # Self-Attention module to endogenous series
         self.norm1= self.get_norm(norm_type, d_model, init_alpha=0.6)
         self.s_att= MultiHeadedAttention(
@@ -879,13 +879,15 @@ class TransformerBlock(nn.Module):
         )
         self.drop_path1= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        if self.multi_modal:
-            # Cross-Attention module to incorporate exogenous covariates
+        # Cross-Attention module to incorporate exogenous covariates
+        if multi_modal:
             self.norm2= self.get_norm(norm_type, d_model, init_alpha=0.6)
             self.c_att= MultiHeadedAttention(
                 depth, d_model, block_size, n_heads, n_kv_heads, dropout, False, bias, rope_theta
             )
             self.drop_path2= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        else:
+            self.c_att= None
 
         # MoE Feed Forward
         self.norm3= self.get_norm(norm_type, d_model, init_alpha=0.2)
@@ -910,7 +912,7 @@ class TransformerBlock(nn.Module):
         x= x + self.drop_path1(self.s_att(
             x_norm, x_norm, x_norm, start_pos, inference, causal_mask, flash_attn
         ))
-        if self.multi_modal and x_cross is not None:
+        if (self.c_att is not None) and (x_cross is not None):
             x_norm= self.norm2(x)
             x= x + self.drop_path2(self.c_att(  # no causal_mask in cross-attention
                 x_norm, x_cross, x_cross, start_pos, inference, None, flash_attn
