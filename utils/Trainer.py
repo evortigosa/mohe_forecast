@@ -60,6 +60,9 @@ class Trainer:
         """
         Train the model for one epoch, returning the training loss and learning rate.
         """
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
         self.model.train()
         train_loss= 0.0
         epoch_lr= 0.0
@@ -120,6 +123,8 @@ class Trainer:
         Train the model for one epoch using bfloat16, returning the training loss and learning rate.
         """
         assert self.device.type == 'cuda', "BF16 training requires CUDA"
+        torch.cuda.empty_cache()
+
         self.model.train()
         train_loss= 0.0
         epoch_lr= 0.0
@@ -277,15 +282,15 @@ class Trainer:
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(epochs, best_val_loss)
 
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
 
     def test(self, test_loader=None, inverse_transform=False, test_criterion=nn.MSELoss(reduction='none')):
         """
         Test the model on a test set.
         Returns the mean test loss, test predictions, and test labels.
         """
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
         test_loader= self.test_loader if test_loader is None else test_loader
         assert test_loader is not None, "test_loader cannot refer to None"
 
@@ -295,9 +300,6 @@ class Trainer:
             mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1, -1, 1).to(self.device)
         else:
             inverse_transform= False
-
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
 
         self.model.eval()
         test_criterion= test_criterion if test_criterion is not None else self.criterion
