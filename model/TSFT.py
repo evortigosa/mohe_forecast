@@ -693,7 +693,7 @@ class EncoderHead(nn.Module):
 
 
 """ 
-# The Time-Series Forecasting Transformer (TSFT) Model
+# The Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts (MoHE) Model
 """
 
 
@@ -711,9 +711,9 @@ class TSFTransformer(nn.Module):
     not SSL, and forecasting=False, we perform time-series classification.
     - norm_type (str): 'layer' for LayerNorm, 'rms' for RMSNorm, or 'dyt' for DynamicTanh.
     - If diff_attn=True, we use differential attention.
-    - ffn_type (str): 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for DwConv-FFN, or 'fan'
-    for FAN-FFN.
-    - experts_type (str): 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
+    'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that
+    can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     """
 
     def __init__(

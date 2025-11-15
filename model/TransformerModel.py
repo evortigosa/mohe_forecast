@@ -739,13 +739,13 @@ Mixture-of-Experts (MoE)
 
 class MoEFeedForward(nn.Module):
     """
-    The Sparse Mixture-of-Experts (MoE) module. Delegate the modeling of diverse time series
-    patterns to sparse specialized experts in a data-driven manner through a sparce gating
-    function (only K of N experts per token) for expert assignments.
+    The Sparse Mixture-of-Experts (MoE) module for heterogeneous experts (MoHE). Delegate the
+    modeling of diverse time series patterns to sparse specialized experts in a data-driven manner
+    through a sparce gating function (only K of N experts per token) for expert assignments.
     - When n_experts=0, forward the input into a single FFN module; MoE otherwise.
     - ffn_type (str): defines the shared_expert type from 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
     'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN.
-    - experts_type (str): defines the experts type from 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - experts_type (str): defines the routed experts from 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     See https://arxiv.org/abs/2410.10469 and https://arxiv.org/abs/2409.16040
     """
 
@@ -774,7 +774,7 @@ class MoEFeedForward(nn.Module):
                 assert len(experts_type) >= n_experts, \
                     "experts_type must be a string or a list of length n_experts"
 
-            # n_experts distinct expert modules
+            # n_experts routed expert modules
             self.experts= nn.ModuleList([
                 self.get_expert_ffn(experts_type[i], d_model, d_ff, dropout, fan_gate, glu, bias)
                 for i in range(n_experts)
@@ -859,9 +859,9 @@ class TransformerBlock(nn.Module):
     - If is_causal=True, we have a Decoder Transformer; otherwise, an Encoder Transformer.
     - norm_type (str): 'layer' for LayerNorm, 'rms' for RMSNorm, or 'dyt' for DynamicTanh.
     - If diff_attn=True, we use Differential Attention.
-    - ffn_type (str): 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for DwConv-FFN, or 'fan' for
-    FAN-FFN.
-    - experts_type (str): 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
+    'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that
+    can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     Note that FlashAttention can be enabled on the fly in the MultiHeadedAttention module
     through the setting of flash_attn in the forward method.
     """
@@ -889,7 +889,7 @@ class TransformerBlock(nn.Module):
         else:
             self.c_att= None
 
-        # MoE Feed Forward
+        # Mixture-of-Experts (MoE) module allows heterogeneous experts (MoHE)
         self.norm3= self.get_norm(norm_type, d_model, init_alpha=0.2)
         self.ffn  = MoEFeedForward(
             d_model, d_ff, dropout, ffn_type, False, glu, n_experts, top_k_experts, experts_type,
@@ -937,9 +937,9 @@ class TransformerModel(nn.Module):
     - If is_causal=True, we have a Decoder Transformer; otherwise, an Encoder Transformer.
     - norm_type (str): 'layer' for LayerNorm, 'rms' for RMSNorm, or 'dyt' for DynamicTanh.
     - If diff_attn=True, we use differential attention.
-    - ffn_type (str): 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for DwConv-FFN, or 'fan' for
-    FAN-FFN.
-    - experts_type (str): 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
+    'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that
+    can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     """
 
     def __init__(self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
