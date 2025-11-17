@@ -781,6 +781,10 @@ class MoEFeedForward(nn.Module):
             ])
             # experts gating to generate token-to-expert affinity scores
             self.gating= nn.Linear(d_model, n_experts, bias=False)
+
+            # initialize gating modules with Glorot / fan_avg
+            nn.init.xavier_uniform_(self.shared_gating.weight)
+            nn.init.xavier_uniform_(self.gating.weight)
         else:
             self.experts= None
 
@@ -805,42 +809,44 @@ class MoEFeedForward(nn.Module):
     def forward(self, x):
         B, T, C= x.size()
 
-        if self.experts is not None:
-            x_squashed= x.view(-1, C)  # (B * T, C)
+        # with no sparse routed experts
+        if self.experts is None:
+            return self.shared_expert(x)
 
-            # compute gating logits and probabilities via softmax
-            self.router_logits= self.gating(x_squashed)  # (B * T, n_experts)
-            router= F.softmax(self.router_logits.float(), dim=-1)
-            # select top-k experts for each token (softmax scores and indices) -> (B * T, K)
-            router, selected_experts= torch.topk(router, self.top_k, dim=-1)
-            # renormalize over top-k so they sum to 1 -- keeps MoE as a convex mixture
-            router /= router.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            # cast back to x dtype
-            router= router.to(x.dtype)
+        # with sparse routed experts
+        x_squashed= x.view(-1, C)  # (B * T, C)
 
-            # one hot the selected experts -- (B * T, K, n_experts) -> (n_experts, K, B * T)
-            expert_mask= F.one_hot(selected_experts, num_classes=len(self.experts)).permute(2, 1, 0)
-            # output buffer
-            results= torch.zeros_like(x_squashed)
+        # compute gating logits and probabilities via softmax
+        self.router_logits= self.gating(x_squashed)  # (B * T, n_experts)
+        router= F.softmax(self.router_logits.float(), dim=-1)
+        # select top-k experts for each token (softmax scores and indices) -> (B * T, K)
+        router, selected_experts= torch.topk(router, self.top_k, dim=-1)
+        # renormalize over top-k so they sum to 1 -- keeps MoE as a convex mixture
+        router /= router.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        # cast back to x dtype
+        router= router.to(x.dtype)
 
-            for expert_idx, expert in enumerate(self.experts):
-                # expert_mask[i] tells us which (rank, token) pairs route to expert i
-                # retrieve pairs where this expert is selected
-                rank_idx, token_idx= torch.where(expert_mask[expert_idx])  # (K, B * T)
-                # index the correct inputs and compute the expert output for the current expert
-                # we route individual token embeddings, not whole sequences
-                expert_inputs = x_squashed[None, token_idx].reshape(-1, C)
-                routing_weight= router[token_idx, rank_idx, None]
+        # one hot the selected experts -- (B * T, K, n_experts) -> (n_experts, K, B * T)
+        expert_mask= F.one_hot(selected_experts, num_classes=len(self.experts)).permute(2, 1, 0)
+        # output buffer
+        results= torch.zeros_like(x_squashed)
 
-                # apply expert and routing weight by gate
-                current_expert= expert(expert_inputs) * routing_weight
-                results.index_add_(0, token_idx, current_expert.to(x_squashed.dtype))
+        for expert_idx, expert in enumerate(self.experts):
+            # expert_mask[i] tells us which (rank, token) pairs route to expert i
+            # retrieve pairs where this expert is selected
+            rank_idx, token_idx= torch.where(expert_mask[expert_idx])  # (K, B * T)
+            # index the correct inputs and compute the expert output for the current expert
+            # we route individual token embeddings, not whole sequences
+            expert_inputs = x_squashed[None, token_idx].reshape(-1, C)
+            routing_weight= router[token_idx, rank_idx, None]
 
-            # shared fallback expert always applied
-            shared_out= self.shared_expert(x) * F.sigmoid(self.shared_gating(x))
-            results= results.view(B, T, C) + shared_out
-        else:  # no sparse experts
-            results= self.shared_expert(x)
+            # apply expert and routing weight by gate
+            current_expert= expert(expert_inputs) * routing_weight
+            results.index_add_(0, token_idx, current_expert.to(x_squashed.dtype))
+
+        # shared fallback expert always applied
+        shared_out= self.shared_expert(x) * F.sigmoid(self.shared_gating(x))
+        results= results.view(B, T, C) + shared_out
 
         return results
 

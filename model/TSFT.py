@@ -384,10 +384,8 @@ class OutputBlock(nn.Module):
                 self.out_proj= nn.Linear(d_model, n_outputs, bias=bias)
 
                 # initialize non-FAN projection modules with Glorot / fan_avg
-                for m in self.modules():
-                    if isinstance(m, nn.Linear):
-                        nn.init.xavier_uniform_(m.weight)
-                        if m.bias is not None: nn.init.zeros_(m.bias)
+                nn.init.xavier_uniform_(self.out_proj.weight)
+                if self.out_proj.bias is not None: nn.init.zeros_(self.out_proj.bias)
         else:
             if ffn_type == 'conv' and forecasting:
                 self.out_proj= ConvFeedForward(d_model, d_ff, n_outputs, dropout, glu=False, bias=bias)
