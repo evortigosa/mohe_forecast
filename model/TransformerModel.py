@@ -750,7 +750,7 @@ class MoEFeedForward(nn.Module):
     """
 
     def __init__(self, d_model, d_ff, dropout=0.2, ffn_type='conv', fan_gate=False, glu=False,
-                 n_experts=4, top_k=2, experts_type='fan', bias=False) -> None:
+                 n_experts=8, top_k=2, experts_type='fan', bias=False) -> None:
         super(MoEFeedForward, self).__init__()
         assert n_experts >= 0, "n_experts must be non-negative"
         # store gating logits for auxiliary load-balancing regularizers (losses)
@@ -759,7 +759,11 @@ class MoEFeedForward(nn.Module):
         # shared fallback expert -- ensures no token is unprocessed if its top-k experts happen
         # to be poorly trained or overflowed
         self.shared_expert= self.get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias)
-        if n_experts > 0:
+
+        if n_experts == 0:
+            self.experts= None
+            self.top_k= 0
+        else:
             # controls contribution from fallback expert
             self.shared_gating= nn.Linear(d_model, 1, bias=False)
 
@@ -785,8 +789,6 @@ class MoEFeedForward(nn.Module):
             # initialize gating modules with Glorot / fan_avg
             nn.init.xavier_uniform_(self.shared_gating.weight)
             nn.init.xavier_uniform_(self.gating.weight)
-        else:
-            self.experts= None
 
 
     def get_ffn(self, ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias):
@@ -822,7 +824,7 @@ class MoEFeedForward(nn.Module):
         # select top-k experts for each token (softmax scores and indices) -> (B * T, K)
         router, selected_experts= torch.topk(router, self.top_k, dim=-1)
         # renormalize over top-k so they sum to 1 -- keeps MoE as a convex mixture
-        router /= router.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        router= router / router.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         # cast back to x dtype
         router= router.to(x.dtype)
 
@@ -848,7 +850,7 @@ class MoEFeedForward(nn.Module):
         shared_out= self.shared_expert(x) * F.sigmoid(self.shared_gating(x))
         results= results.view(B, T, C) + shared_out
 
-        return results
+        return results.contiguous()
 
 
 
