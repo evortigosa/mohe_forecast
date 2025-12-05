@@ -86,6 +86,7 @@ class QKRoPE(nn.Module):
         else:
             # compute rotation matrix to Query and Key for training
             freqs_cis= self.precompute_freqs_cis(self.block_size, q.device)
+            freqs_cis= freqs_cis[:T]
 
         # applying rotary positional encoding to both Query and Key embedding together
         # q/k_ci[B, T, n_(kv_)heads, dh/2] -- reshape last dimension into pairs
@@ -749,7 +750,7 @@ class MoEFeedForward(nn.Module):
     See https://arxiv.org/abs/2410.10469 and https://arxiv.org/abs/2409.16040
     """
 
-    def __init__(self, d_model, d_ff, dropout=0.2, ffn_type='conv', fan_gate=False, glu=False,
+    def __init__(self, d_model, d_ff, dropout=0.2, ffn_type='dwconv', fan_gate=False, glu=False,
                  n_experts=8, top_k=2, experts_type='fan', bias=False) -> None:
         super(MoEFeedForward, self).__init__()
         assert n_experts >= 0, "n_experts must be non-negative"

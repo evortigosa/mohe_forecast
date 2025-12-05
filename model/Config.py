@@ -16,9 +16,10 @@ class BaseConfig:
     - n_outputs (int): Default is 96. Defines the forecasting horizon.
     - width_factor (float): Default is 1.5. Defines the output horizon as multiple of patch_width.
     - multi_modal (bool): Default is True. Enables the cross-attention module for covariate injection.
-    - is_causal (bool): Default is False. Encoder Transformer (False) or Decoder Transformer (True)
+    - is_causal (bool): Default is False. Encoder Transformer (False) or Decoder Transformer (True).
     - forecasting (bool): Default is True. Defines the model as a forecaster.
-    - mask_ratio (float): Default is 0. Enables representation learning
+    - mask_ratio (float): Default is 0. Enables representation learning.
+    - mask_type (str): Default is 'mae' for a MAE-style masking. This can be 'mae' or 'random'.
     - n_layer (int): Default is 6. Defines the number of transformer layers/blocks.
     - d_model (int): Default is 256. Defines the model dimension.
     - block_size (int): Default is 672. Defines the max size of the look-back window.
@@ -52,6 +53,7 @@ class BaseConfig:
     is_causal:bool= False          # Encoder Transformer (False) or Decoder Transformer (True)
     forecasting:bool= True
     mask_ratio:float= 0.           # enables representation learning
+    mask_type:str= 'mae'           # mae, random
     n_layer:int= 6
     d_model:int= 256
     block_size:int= 672

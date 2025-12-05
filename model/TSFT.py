@@ -69,6 +69,49 @@ class PatchMasking(nn.Module):
 
 
 
+class PatchMaskingMAE(nn.Module):
+    """
+    Performs random masking to the patch embeddings for self-supervised training tasks.
+    Masked Autoencoder (MAE) style: Only the visible patches are keep to feed the model.
+    Adapted from https://arxiv.org/abs/2111.06377
+    """
+
+    def __init__(self, mask_ratio=0.2) -> None:
+        super(PatchMaskingMAE, self).__init__()
+        assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
+        self.mask_ratio= mask_ratio
+
+
+    def extra_repr(self):
+        return f"mask_ratio={self.mask_ratio}"
+
+
+    def forward(self, x):
+        if (not self.training) or self.mask_ratio== 0.0:
+            return x, None, None
+
+        B, P, C= x.size()  # (batch_size, num_patches, d_model)
+        # determine the number of patches to keep
+        pto_keep= int(P * (1 - self.mask_ratio))
+        # generate random indices for masking -- noise in [0, 1]
+        # ascend: small is keep, large is remove
+        ids_shuffle= torch.rand(B, P, dtype=x.dtype, device=x.device).argsort(dim=1)
+        ids_restore= torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep= ids_shuffle[:, :pto_keep]
+        x_masked= torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask= torch.ones([B, P], device=x.device)
+        mask[:, :pto_keep]= 0
+        # unshuffle to get the binary mask
+        mask= torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked, mask, ids_restore
+
+
+
 class IntTemporalEmbedding(nn.Module):
     """
     Initializes the Temporal Embedding module for handling calendar covariates (hour‑of‑day,
@@ -413,11 +456,10 @@ class UnPatchV3(nn.Module):
     See https://arxiv.org/abs/2201.03545
     """
 
-    def __init__(self, patch_width, channels, d_model, is_ssl_on, dropout=0.2, bias=False) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False) -> None:
         super(UnPatchV3, self).__init__()
         assert d_model % patch_width == 0, "d_model must be divisible by patch_width"
         self.channels = channels
-        self.is_ssl_on= is_ssl_on
         pw_d_model= round_channels(d_model // patch_width)
         hidden_dim= round_channels(pw_d_model * 4)
         out_channels= 1
@@ -452,11 +494,6 @@ class UnPatchV3(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
 
 
-    def extra_repr(self):
-        if not self.is_ssl_on:
-            return "--- Under SSL pre-training mode ---"
-
-
     def forward(self, x):
         # x -> (batch_size * channels/features, num_patches, d_model)
         if self.dropout is not None:
@@ -479,11 +516,10 @@ class UnPatch(nn.Module):
     See https://arxiv.org/abs/2201.03545
     """
 
-    def __init__(self, patch_width, channels, d_model, is_ssl_on, dropout=0.2, bias=False) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False) -> None:
         super(UnPatch, self).__init__()
         assert d_model % 4 == 0, "d_model must be divisible by 4"
         self.channels = channels
-        self.is_ssl_on= is_ssl_on
         hidden_dim= round_channels(d_model // 4)
         out_channels= 1
         # calculate kernel_size and padding of the depthwise conv based on patch_width
@@ -516,11 +552,6 @@ class UnPatch(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
 
 
-    def extra_repr(self):
-        if not self.is_ssl_on:
-            return "--- Under SSL pre-training mode ---"
-
-
     def forward(self, x):
         # x -> (batch_size * channels/features, num_patches, d_model)
         if self.dropout is not None:
@@ -543,11 +574,10 @@ class LinearUnPatch(nn.Module):
     - From a (B, P, C) tensor into a (B, D, H) forecast.
     """
 
-    def __init__(self, n_patches, channels, d_model, n_outputs, is_ssl_on, dropout=0.2,
+    def __init__(self, n_patches, channels, d_model, n_outputs, dropout=0.2,
                  bias=False, individual=False) -> None:
         super(LinearUnPatch, self).__init__()
         self.channels  = channels
-        self.is_ssl_on = is_ssl_on
         self.individual= individual
         input_dim= n_patches * d_model
 
@@ -565,11 +595,6 @@ class LinearUnPatch(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None: nn.init.zeros_(m.bias)
-
-
-    def extra_repr(self):
-        if not self.is_ssl_on:
-            return "--- Under SSL pre-training mode ---"
 
 
     def forward(self, x):
@@ -607,7 +632,7 @@ class LinearUnPatch(nn.Module):
 class DecoderHead(nn.Module):
     """
     Define the final projection head for Decoder-only (generative) models. (receives feature_maps
-    to UnPatch, output shape -> [batch_size, channels/features, seq_length])
+    to UnPatch, output shape -> [batch_size, channels/features, seq_length]).
     """
 
     def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
@@ -616,9 +641,9 @@ class DecoderHead(nn.Module):
         # decoder projection head
         self.d_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
         if unpatch == 'linear':
-            self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, True, dropout, bias)
+            self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias)
         else:
-            self.unpatch= UnPatch(patch_width, channels, d_model, True, dropout, bias)
+            self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias)
 
 
     def forward(self, x):
@@ -631,24 +656,32 @@ class DecoderHead(nn.Module):
 class EncoderSSLHead(nn.Module):
     """
     Define the final head for Encoder-only models under SSL pre-training mode (receives
-    feature_maps to UnPatch, output shape -> [batch_size, channels/features, seq_length])
+    feature_maps to UnPatch, output shape -> [batch_size, channels/features, seq_length]
+    when mask_type is not 'mae'; otherwise, outputs feature_maps).
     """
 
     def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
-                 head_type='mlp', bias=False, fine_tune=False, unpatch='conv') -> None:
+                 mask_type='mae', head_type='mlp', bias=False, fine_tune=False, unpatch='conv') -> None:
         super(EncoderSSLHead, self).__init__()
         # encoder under SSL pre-training mode
-        self.e_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
-        if unpatch == 'linear':
-            self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, False, dropout, bias)
+        if mask_type == 'mae':
+            self.e_head= nn.Identity()
         else:
-            self.unpatch= UnPatch(patch_width, channels, d_model, False, dropout, bias)
+            if unpatch == 'linear':
+                unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias)
+            else:
+                unpatch= UnPatch(patch_width, channels, d_model, dropout, bias)
+
+            self.e_head= nn.Sequential(
+                OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune),
+                unpatch,
+            )
 
 
     def forward(self, x):
         x= self.e_head(x)
 
-        return self.unpatch(x)
+        return x
 
 
 
@@ -670,9 +703,9 @@ class EncoderHead(nn.Module):
             # encoder forecasting head
             self.e_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
             if unpatch == 'linear':
-                self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, True, dropout, bias)
+                self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias)
             else:
-                self.unpatch= UnPatch(patch_width, channels, d_model, True, dropout, bias)
+                self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias)
         else:
             # encoder classification head
             self.e_head= OutputBlock(
@@ -716,7 +749,7 @@ class TSFTransformer(nn.Module):
 
     def __init__(
         self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
-        is_causal=False, forecasting=True, mask_ratio=0., n_layer=6, d_model=256, block_size=672,
+        is_causal=False, forecasting=True, mask_ratio=0., mask_type='mae', n_layer=6, d_model=256, block_size=672,
         n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
         diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
         output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
@@ -734,14 +767,14 @@ class TSFTransformer(nn.Module):
         # standardize text-based hyperparameters
         norm_type= norm_type.lower()
         emb_norm_type= emb_norm_type.lower()
+        mask_type= mask_type.lower()
         ffn_type= ffn_type.lower()
         experts_type= experts_type.lower()
         output_head_type= output_head_type.lower()
         unpatch= unpatch.lower()
 
-        self.n_outputs  = int(n_outputs)
-        self.multi_modal= multi_modal
-        self.is_causal  = is_causal
+        self.n_outputs= int(n_outputs)
+        self.is_causal= is_causal
         # ensure mask_ratio is only available for Encoders
         mask_ratio= mask_ratio if not is_causal else 0.0
         # ensure forecasting mode for Encoders under no SSL objective
@@ -760,8 +793,8 @@ class TSFTransformer(nn.Module):
         #self.input_norm= RevIN(channels, eps=1e-5) if use_input_norm else None
 
         self.config= BaseConfig(
-            self.patch_width, channels, self.n_outputs, self.width_factor, self.multi_modal,
-            self.is_causal, self.forecasting, mask_ratio, n_layer, d_model, self.block_size,
+            self.patch_width, channels, self.n_outputs, self.width_factor, multi_modal,
+            self.is_causal, self.forecasting, mask_ratio, mask_type, n_layer, d_model, self.block_size,
             n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, flash_attn, diff_attn,
             ffn_type, glu, n_experts, top_k_experts, experts_type, output_head_type, fine_tune,
             unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout
@@ -773,10 +806,15 @@ class TSFTransformer(nn.Module):
         else:
             self.t_embedding= PatchEmbedding(self.patch_width, channels, d_model, dropout)
         # define SSL patch masking with a mask_ratio (Encoder-only)
-        self.mask_layer= PatchMasking(mask_ratio) if mask_ratio > 0.0 else None
+        if mask_ratio > 0.0:
+            self.mask_layer= PatchMaskingMAE(mask_ratio) if mask_type == 'mae' else PatchMasking(mask_ratio)
+        else:
+            self.mask_layer= None
         # define the patch embedding for exogenous calendar covariates
         if multi_modal:
             self.c_embedding= MultiModalEmbedding(self.patch_width, channels, d_model, dropout, emb_norm_type)
+        else:
+            self.c_embedding= None
 
         # define the backbone transformer model
         self.backbone= TransformerModel(
@@ -794,11 +832,10 @@ class TSFTransformer(nn.Module):
                 output_head_type, bias, fine_tune, unpatch
             )
         else:
-            is_ssl_mode= True if self.mask_layer is not None else False
-            if is_ssl_mode:
+            if self.mask_layer is not None:
                 self.head= EncoderSSLHead(
                     self.patch_width, patch_dim, channels, d_model, d_ff, self.block_size, output_head_dropout,
-                    output_head_type, bias, fine_tune, unpatch
+                    mask_type, output_head_type, bias, fine_tune, unpatch
                 )
             else:
                 out_dim= self.block_size if self.forecasting else self.n_outputs
@@ -979,12 +1016,17 @@ class TSFTransformer(nn.Module):
             ts= self.input_norm(ts, 'norm')
 
         x= self.t_embedding(ts)  # (B * C, P, d_model)
+
         # patch masking when in SSL mode
+        mask, ids_restore= None, None
         if self.mask_layer is not None:
-            x= self.mask_layer(x)
+            if isinstance(self.mask_layer, PatchMaskingMAE):
+                x, mask, ids_restore= self.mask_layer(x)
+            else:
+                x= self.mask_layer(x)
 
         # embed covariates (if any) to forward it into the cross-attention modules
-        if self.multi_modal and ts_mark is not None:
+        if (self.c_embedding is not None) and (ts_mark is not None):
             x_cross= self.c_embedding(ts_mark, ts)  # (B * C, P, d_model)
         else:
             x_cross= None
@@ -992,7 +1034,7 @@ class TSFTransformer(nn.Module):
         # forward the embeddings through the transformer
         x, router_logits= self.backbone(x, x_cross, start_pos, inference)
 
-        if self.is_causal or self.forecasting or self.mask_layer is not None:
+        if self.is_causal or self.forecasting or (self.mask_layer is not None):
             # full feature map (representing individual patch embeddings)
             out= self.latent_space(x)  # (B * C, P, d_model)
         else:
@@ -1002,7 +1044,10 @@ class TSFTransformer(nn.Module):
         # the output head generates logits according to the task
         logits= self.head(out)
 
-        if self.input_norm is not None and logits.ndim == ts.ndim:
+        if (mask is not None) and (ids_restore is not None):
+            return logits, router_logits, mask, ids_restore
+
+        if (self.input_norm is not None) and logits.ndim == ts.ndim:
             logits= self.input_norm(logits, 'denorm')
 
         return logits, router_logits
