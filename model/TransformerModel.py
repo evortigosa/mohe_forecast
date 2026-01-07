@@ -340,13 +340,14 @@ Group Query Multi-Headed Attention
 
 class MultiHeadedAttention(nn.Module):
     """
-    The Group Query Multi-Headed Attention Module [RoPE and Group Query Attention].
+    The Group Query Multi-Headed Attention Module [RoPE, Group Query, and Gated Attention].
     Note that FlashAttention can be enabled on the fly through the setting of flash_attn in the
     forward method.
+    See https://arxiv.org/abs/2305.13245 and https://arxiv.org/abs/2505.06708
     """
 
     def __init__(self, depth, d_model, block_size, n_heads, n_kv_heads, dropout=0.2, diff_attn=False,
-                 bias=False, rope_theta=10000.0) -> None:
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False) -> None:
         super(MultiHeadedAttention, self).__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.d_model= d_model
@@ -357,12 +358,17 @@ class MultiHeadedAttention(nn.Module):
         assert n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         self.n_rep= n_heads // self.n_kv_heads
         # when diff_attn is active, halve the effective head dimension for q and k (but not for v)
-        self.diff_factor= 1 if not diff_attn else 2
+        self.diff_factor= 1 if (not diff_attn) or headwise_attn_gate else 2
         self.d_head = d_model // n_heads // self.diff_factor
         self.scaling= 1.0 / math.sqrt(self.d_head)
+        self.use_qk_norm= use_qk_norm
+        self.headwise_attn_gate= headwise_attn_gate
 
         # query, key, value projections
-        self.q_proj= nn.Linear(d_model, d_model, bias=True)
+        if headwise_attn_gate:
+            self.q_proj= nn.Linear(d_model, d_model + n_heads, bias=True)
+        else:
+            self.q_proj= nn.Linear(d_model, d_model, bias=True)
         self.k_proj= nn.Linear(d_model, d_model // self.n_rep, bias=True)
         self.v_proj= nn.Linear(d_model, d_model // self.n_rep, bias=True)
         # Rotary Positional Encoding module
@@ -370,10 +376,10 @@ class MultiHeadedAttention(nn.Module):
         # regularization
         dropout_module= nn.Dropout(p=dropout)
         # differential Attention module
-        self.diff_attn= None if not diff_attn else DifferentialAttention(
+        self.diff_attn= None if self.diff_factor == 1 else DifferentialAttention(
             n_heads, self.d_head, depth, dropout_module
         )
-        self.dropout= dropout_module if not diff_attn else None
+        self.dropout= dropout_module if (self.diff_attn is None) else None
         # output projection
         self.o_proj= nn.Linear(d_model, d_model, bias=bias)
 
@@ -421,13 +427,22 @@ class MultiHeadedAttention(nn.Module):
         q= self.q_proj(xq)  # q -> (B, T, C)
         k= self.k_proj(xk)  # k -> (B, T, C // n_rep)
         v= self.v_proj(xv)  # v -> (B, T, C // n_rep)
+
+        if self.headwise_attn_gate:
+            q= q.view(B, T, self.n_kv_heads, -1)
+            q, attn_gate= torch.split(q, [self.d_head * self.n_rep, self.n_rep], dim=-1)
+            attn_gate= attn_gate.reshape(B, T, -1, 1)
+            q= q.reshape(B, T, -1, self.d_head)
+        else:
+            q= q.view(B, -1, self.n_heads * self.diff_factor, self.d_head)  # q view -> (B, T, nh,   dh)
+
         # reshape for Group Query Multi-Headed Attention (double n_heads for q and k when diff_attn)
-        q= q.view(B, -1, self.n_heads    * self.diff_factor,  self.d_head)  # q view -> (B, T, nh,   dh)
         k= k.view(B, -1, self.n_kv_heads * self.diff_factor,  self.d_head)  # k view -> (B, T, nkvh, dh)
         v= v.view(B, -1, self.n_kv_heads,  self.diff_factor * self.d_head)  # v view -> (B, T, nkvh, dh)
         # apply RoPE to query and key embeddings
         q, k= self.ropenc(q, k, start_pos, inference)
-        # q, k= self.norm(q), self.norm(k)  # QK norm
+        if self.use_qk_norm:
+            q, k= self.norm(q), self.norm(k)  # QK norm
         # here, key and value shapes are not the same with query, which has to be to compute
         # Attention scores
         k= self.repeat_kv(k, self.n_rep)  # k -> (B, T, nh, dh)
@@ -464,7 +479,12 @@ class MultiHeadedAttention(nn.Module):
                 y= self.diff_attn(q, k, v, causal_mask, flash_attn)
 
         # concatenate multi-head outputs -- re-assembly all head outputs side by side
-        y= y.transpose(1, 2).contiguous().view(B, -1, C)  # (B, T, nh, dh) -> (B, T, C)
+        y= y.transpose(1, 2).contiguous()
+
+        if self.headwise_attn_gate:
+            y= y * torch.sigmoid(attn_gate)
+
+        y= y.reshape(B, -1, C)  # (B, T, nh, dh) -> (B, T, C)
         # output projection
         return self.o_proj(y)
 
