@@ -371,7 +371,7 @@ class MultiHeadedAttention(nn.Module):
             self.q_proj= nn.Linear(d_model, d_model, bias=True)
         self.k_proj= nn.Linear(d_model, d_model // self.n_rep, bias=True)
         self.v_proj= nn.Linear(d_model, d_model // self.n_rep, bias=True)
-        # Rotary Positional Encoding module
+        # Rotary Positional Encoding (RoPE) module
         self.ropenc= QKRoPE(self.d_head, block_size, rope_theta)
         # regularization
         dropout_module= nn.Dropout(p=dropout)
