@@ -475,6 +475,49 @@ class MultiModalEmbedding(nn.Module):
 
 
 
+class EmbeddingDecoderMAE(nn.Module):
+    """
+    Expand the input for a Masked Autoencoder (MAE) style decoder. Only the visible patches are
+    keep by a MAE style encoder model. This module places random tokens in the masked positions
+    to feed the MAE style decoder.
+    Adapted from https://arxiv.org/abs/2111.06377
+    """
+
+    def __init__(self, enc_d_model, dec_d_model, bias=False) -> None:
+        super(EmbeddingDecoderMAE, self).__init__()
+        self.decoder_embed= nn.Linear(enc_d_model, dec_d_model, bias=bias)
+        self.mask_token= nn.Parameter(torch.zeros(1, 1, dec_d_model))
+
+        # initialize nn.Linear modules with Glorot / fan_avg
+        nn.init.xavier_uniform_(self.decoder_embed.weight)
+        if self.decoder_embed.bias is not None: nn.init.zeros_(self.decoder_embed.bias)
+        torch.nn.init.normal_(self.mask_token, std=.02)
+
+
+    def forward(self, x, ids_restore, has_cls_tk=False):
+        # embed tokens to decoder d_model
+        x= self.decoder_embed(x)
+        # append mask tokens to sequence
+        mask_tokens= self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+
+        if has_cls_tk:
+            # temporarily remove the cls token
+            x_= torch.cat([x[:, 1:, :], mask_tokens], dim=1)
+        else:
+            x_= torch.cat([x, mask_tokens], dim=1)
+
+        # unshuffle
+        x_= torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+
+        if has_cls_tk:
+            # append cls token
+            x= torch.cat([x[:, :1, :], x_], dim=1)
+            return x
+
+        return x_
+
+
+
 """
 # Output Modules
 """
