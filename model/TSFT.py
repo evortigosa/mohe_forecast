@@ -58,7 +58,7 @@ class PositionalEmbedding(nn.Module):
         # create an empty placeholder
         wpe= torch.zeros(block_size, d_model).float()
         wpe.require_grad= False
-        # itterating over each element in the sequence using sin and cos
+        # iterating over each element in the sequence using sin and cos
         wpe[:, 0::2]= torch.sin(position * frequencies)
         wpe[:, 1::2]= torch.cos(position * frequencies)
         # register_buffer -- it is not saved in the state_dict nor optimized
@@ -80,27 +80,29 @@ class PatchMasking(nn.Module):
     """
     Applies random masking to the patch embeddings for self-supervised training tasks.
     A specified fraction (mask_ratio) of patches is set to zero.
+    - If has_cls_tk=True, the class token (first token) is not masked.
     """
 
-    def __init__(self, mask_ratio=0.2) -> None:
+    def __init__(self, mask_ratio=0.2, has_cls_tk=False) -> None:
         super(PatchMasking, self).__init__()
         assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
         self.mask_ratio= mask_ratio
+        self.has_cls_tk= has_cls_tk
 
 
     def extra_repr(self):
-        return f"mask_ratio={self.mask_ratio}"
+        return f"mask_ratio={self.mask_ratio}, cls_token={self.has_cls_tk}"
 
 
-    def forward(self, x, x_cross=None, has_cls_tk=False):
+    def forward(self, x, x_cross=None):
         if (not self.training) or self.mask_ratio== 0.0:
             return x, x_cross
 
-        if has_cls_tk:
+        if self.has_cls_tk:
             # ensure the class token will not be masked
             cls= x[:, 0, :]
             x  = x[:, 1:, :]
-            if (x_cross is not None):
+            if x_cross is not None:
                 cls_cross= x_cross[:, 0, :]
                 x_cross  = x_cross[:, 1:, :]
 
@@ -112,12 +114,12 @@ class PatchMasking(nn.Module):
 
         # set masked positions to zero
         x= x.masked_fill(mask, value=0.0)
-        if has_cls_tk:
+        if self.has_cls_tk:
             x= torch.cat((cls.unsqueeze(1), x), dim=1)
 
-        if (x_cross is not None):
+        if x_cross is not None:
             x_cross= x_cross.masked_fill(mask, value=0.0)
-            if has_cls_tk:
+            if self.has_cls_tk:
                 x_cross= torch.cat((cls_cross.unsqueeze(1), x_cross), dim=1)
 
         return x, x_cross
@@ -128,28 +130,30 @@ class PatchMaskingMAE(nn.Module):
     """
     Performs random masking to the patch embeddings for self-supervised training tasks.
     Masked Autoencoder (MAE) style: Only the visible patches are keep to feed the model.
+    - If has_cls_tk=True, the class token (first token) is not masked.
     Adapted from https://arxiv.org/abs/2111.06377
     """
 
-    def __init__(self, mask_ratio=0.2) -> None:
+    def __init__(self, mask_ratio=0.2, has_cls_tk=False) -> None:
         super(PatchMaskingMAE, self).__init__()
         assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
         self.mask_ratio= mask_ratio
+        self.has_cls_tk= has_cls_tk
 
 
     def extra_repr(self):
-        return f"mask_ratio={self.mask_ratio}"
+        return f"mask_ratio={self.mask_ratio}, cls_token={self.has_cls_tk}"
 
 
-    def forward(self, x, x_cross=None, has_cls_tk=False):
+    def forward(self, x, x_cross=None):
         if (not self.training) or self.mask_ratio== 0.0:
             return x, x_cross, None, None
 
-        if has_cls_tk:
+        if self.has_cls_tk:
             # ensure the class token will not be masked
             cls= x[:, 0, :]
             x  = x[:, 1:, :]
-            if (x_cross is not None):
+            if x_cross is not None:
                 cls_cross= x_cross[:, 0, :]
                 x_cross  = x_cross[:, 1:, :]
 
@@ -164,12 +168,12 @@ class PatchMaskingMAE(nn.Module):
         # keep the first subset
         ids_keep= ids_shuffle[:, :pto_keep]
         x_masked= torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
-        if has_cls_tk:
+        if self.has_cls_tk:
             x_masked= torch.cat((cls.unsqueeze(1), x_masked), dim=1)
 
-        if (x_cross is not None):
+        if x_cross is not None:
             x_cross_masked= torch.gather(x_cross, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
-            if has_cls_tk:
+            if self.has_cls_tk:
                 x_cross_masked= torch.cat((cls_cross.unsqueeze(1), x_cross_masked), dim=1)
         else:
             x_cross_masked= None
@@ -483,8 +487,9 @@ class EmbeddingDecoderMAE(nn.Module):
     Adapted from https://arxiv.org/abs/2111.06377
     """
 
-    def __init__(self, enc_d_model, dec_d_model, bias=False) -> None:
+    def __init__(self, enc_d_model, dec_d_model, has_cls_tk=False, bias=False) -> None:
         super(EmbeddingDecoderMAE, self).__init__()
+        self.has_cls_tk= has_cls_tk
         self.decoder_embed= nn.Linear(enc_d_model, dec_d_model, bias=bias)
         self.mask_token= nn.Parameter(torch.zeros(1, 1, dec_d_model))
 
@@ -494,14 +499,14 @@ class EmbeddingDecoderMAE(nn.Module):
         torch.nn.init.normal_(self.mask_token, std=.02)
 
 
-    def forward(self, x, ids_restore, has_cls_tk=False):
+    def forward(self, x, ids_restore):
         # embed tokens to decoder d_model
         x= self.decoder_embed(x)
         # append mask tokens to sequence
         mask_tokens= self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
 
-        if has_cls_tk:
-            # temporarily remove the cls token
+        if self.has_cls_tk:
+            # temporarily remove the cls token from the input
             x_= torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         else:
             x_= torch.cat([x, mask_tokens], dim=1)
@@ -509,8 +514,8 @@ class EmbeddingDecoderMAE(nn.Module):
         # unshuffle
         x_= torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
 
-        if has_cls_tk:
-            # append cls token
+        if self.has_cls_tk:
+            # append cls token from the input
             x= torch.cat([x[:, :1, :], x_], dim=1)
             return x
 
@@ -930,9 +935,9 @@ class TSFTransformer(nn.Module):
         # define SSL patch masking with a mask_ratio (Encoder-only)
         if mask_ratio > 0.0 and mask_type == 'mae':
             rope_theta= 0.0
-            self.mask_layer= PatchMaskingMAE(mask_ratio)
+            self.mask_layer= PatchMaskingMAE(mask_ratio, cls_token)
         elif mask_ratio > 0.0:
-            self.mask_layer= PatchMasking(mask_ratio)
+            self.mask_layer= PatchMasking(mask_ratio, cls_token)
         else:
             self.mask_layer= None
 
@@ -1152,9 +1157,7 @@ class TSFTransformer(nn.Module):
 
         x= self.t_embedding(ts)  # (B * C, P, d_model)
 
-        has_cls_tk= False
         if self.cls_token is not None:
-            has_cls_tk= True
             # repeat a class token (CLS) for each sequence in the batch
             cls_tk= repeat(self.cls_token, '1 1 d -> b 1 d', b=B*C)
             # append CLS tokens with patch embeddings
@@ -1182,9 +1185,9 @@ class TSFTransformer(nn.Module):
         mask, ids_restore= None, None
         if self.mask_layer is not None:
             if isinstance(self.mask_layer, PatchMaskingMAE):
-                x, x_cross, mask, ids_restore= self.mask_layer(x, x_cross, has_cls_tk)
+                x, x_cross, mask, ids_restore= self.mask_layer(x, x_cross)
             else:
-                x, x_cross= self.mask_layer(x, x_cross, has_cls_tk)
+                x, x_cross= self.mask_layer(x, x_cross)
 
         # forward the embeddings through the transformer
         x, router_logits= self.backbone(x, x_cross, start_pos, inference)
