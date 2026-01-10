@@ -24,6 +24,7 @@ class QKRoPE(nn.Module):
     The Rotary Positional Encoding (RoPE) functions for Query and Key embeddings.
     It precomputes complex rotation factors (in polar form) and applies them to the Query and Key
     embeddings after reshaping the last dimension into pairs.
+    - When theta<=0, no rotation is applied.
     - Based on https://arxiv.org/abs/2407.21783
     """
 
@@ -87,6 +88,107 @@ class QKRoPE(nn.Module):
             # compute rotation matrix to Query and Key for training
             freqs_cis= self.precompute_freqs_cis(self.block_size, q.device)
             freqs_cis= freqs_cis[:T]
+
+        # applying rotary positional encoding to both Query and Key embedding together
+        # q/k_ci[B, T, n_(kv_)heads, dh/2] -- reshape last dimension into pairs
+        q_ci= torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+        k_ci= torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+
+        # reshape freqs_cis for broadcast to match the dimensions of x
+        freqs_cis= self.reshape_for_broadcast(freqs_cis, q_ci)
+
+        # q/k_out[B, T, n_(kv_)heads, dh]
+        q_out= torch.view_as_real(q_ci * freqs_cis).flatten(3)
+        k_out= torch.view_as_real(k_ci * freqs_cis).flatten(3)
+
+        return q_out.type_as(q), k_out.type_as(k)
+
+
+
+class QKRoPEv1(nn.Module):
+    """
+    --- Improved version - freqs in a non-persistent buffer ---
+    The Rotary Positional Encoding (RoPE) functions for Query and Key embeddings.
+    It precomputes complex rotation factors (in polar form) and applies them to the Query and Key
+    embeddings after reshaping the last dimension into pairs.
+    - When theta<=0, no rotation is applied.
+    - Based on https://arxiv.org/abs/2407.21783
+    """
+
+    def __init__(self, d_head, block_size, theta=10000.0) -> None:
+        super(QKRoPEv1, self).__init__()
+        assert d_head % 2 == 0, "d_head must be even for RoPE"
+        self.d_head= d_head
+        self.block_size= block_size
+        self.theta= theta
+        self.register_buffer("freqs_cis", None, persistent=False)
+
+
+    def extra_repr(self):
+        return f"block_size={self.block_size}, theta={self.theta}"
+
+
+    @staticmethod
+    def precompute_freqs_cis(max_len, d_head, theta, device):
+        """
+        Precompute the complex rotation factors for the given sequence length.
+        """
+        # computing inverse frequencies for each pair in the head dimension
+        inv_freq= 1.0 / (theta ** (
+            torch.arange(0, d_head, 2, dtype=torch.int64, device=device)[: (d_head // 2)].float() / d_head
+        ))
+        # computing positions vector
+        t= torch.arange(max_len, dtype=torch.int64, device=device).type_as(inv_freq)
+        # freqs gives all the angles for all the position of tokens in the sequence
+        freqs= torch.outer(t, inv_freq)
+        # the rotation matrix needs to be converted to complex numbers in polar form
+        freqs_cis= torch.polar(torch.ones_like(freqs), freqs)
+
+        return freqs_cis
+
+
+    def ensure_cache(self, max_len, device):
+        need_recompute= (
+            self.freqs_cis is None or self.freqs_cis.device != device
+            or self.freqs_cis.shape[0] < max_len
+        )
+        if need_recompute:
+            freqs_cis= self.precompute_freqs_cis(max_len, self.d_head, self.theta, device)
+            # register_buffer already created; assign
+            self.freqs_cis= freqs_cis
+
+
+    @staticmethod
+    def reshape_for_broadcast(freqs_cis, x):
+        """
+        Reshape freqs_cis for broadcast to match the dimensions of x.
+        """
+        ndim= x.ndim
+        assert ndim >= 2, "x should have at least 2 dimensions"
+        assert freqs_cis.shape == (x.shape[1], x.shape[-1]), \
+            "The last two dimension of freqs_cis and x must match"
+        # create a shape that has dimension 1 for all dims except dim1 (T) and last dim
+        shape= [d if i == 1 or i == ndim -1 else 1 for i, d in enumerate(x.shape)]
+
+        return freqs_cis.view(*shape)
+
+
+    def forward(self, q, k, start_pos=0, inference=False):
+        if self.theta <= 0.:
+            return q, k
+
+        B, T, _, _= q.shape  # shape (B, T, nh, dh)
+
+        rotary_seq_len= self.block_size * 4  # 4X over-compute should be enough
+        # compute rotation matrix for each position in the rotary sequence
+        self.ensure_cache(rotary_seq_len, q.device)
+
+        if inference:
+            # during inference, we should only take the rotation matrix range from the current
+            # position of the tokens
+            freqs_cis= self.freqs_cis[start_pos : start_pos + T]
+        else:
+            freqs_cis= self.freqs_cis[:T]
 
         # applying rotary positional encoding to both Query and Key embedding together
         # q/k_ci[B, T, n_(kv_)heads, dh/2] -- reshape last dimension into pairs

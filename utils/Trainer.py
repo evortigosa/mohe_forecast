@@ -86,7 +86,7 @@ class Trainer:
                 data= (self.augmentation(data)).to(self.device)
 
             # --- forward pass and get loss ---
-            logits, router_logits= self.model(data, ts_mark=data_time)
+            logits, router_logits, *_= self.model(data, ts_mark=data_time)
             # compute training loss on the scaled data
             losses= self.criterion(logits, target)
             loss= torch.mean(losses)
@@ -94,12 +94,19 @@ class Trainer:
             if self.aux_criterion is not None:
                 aux_loss= self.aux_criterion(router_logits, padding_mask)
                 loss= loss + aux_loss
+
+            # check loss finite
+            if not torch.isfinite(loss).all():
+                any_nonfinite_loss= True
+                # best to raise early to see where it happened
+                raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
+
             # sample‑weighted average loss
             train_loss += float(loss.item()) * data.size(0)
 
             # --- backward pass to calculate the gradients ---
             loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            #torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
@@ -152,7 +159,7 @@ class Trainer:
             # --- forward pass and get loss ---
             # model, optimizer defined as usual; model parameters kept as float32
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits, router_logits= self.model(data, ts_mark=data_time)
+                logits, router_logits, *_= self.model(data, ts_mark=data_time)
                 # compute training loss on the scaled data
                 losses= self.criterion(logits, target)
                 loss= torch.mean(losses)
@@ -173,7 +180,7 @@ class Trainer:
             # --- backward pass to calculate the gradients ---
             # gradients computed in bfloat16, but accumulation and params remain TF32
             loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
@@ -216,7 +223,7 @@ class Trainer:
                 target= target.to(self.device)
 
                 # --- forward pass and get loss ---
-                logits, _= self.model(data, ts_mark=data_time)
+                logits, *_= self.model(data, ts_mark=data_time)
                 losses= val_criterion(logits, target)
                 loss= torch.mean(losses)
 
@@ -296,8 +303,8 @@ class Trainer:
 
         if self.train_ds_scaler is not None:
             inverse_transform= inverse_transform
-            scale_= torch.from_numpy(self.train_ds_scaler.scale_).float().view(1, -1, 1).to(self.device)
-            mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1, -1, 1).to(self.device)
+            scale_= torch.from_numpy(self.train_ds_scaler.scale_).float().view(1,-1,1).to(self.device)
+            mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1,-1,1).to(self.device)
         else:
             inverse_transform= False
 
@@ -328,7 +335,7 @@ class Trainer:
                         logits= logits * scale_ + mean_
                         target= target * scale_ + mean_
                 else:
-                    logits, _= self.model(data, ts_mark=data_time)
+                    logits, *_= self.model(data, ts_mark=data_time)
                 losses= test_criterion(logits, target)
                 loss= torch.mean(losses)
 

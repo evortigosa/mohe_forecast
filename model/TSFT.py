@@ -7,6 +7,7 @@ import math
 import inspect
 import torch
 import torch.nn as nn
+from einops import repeat
 from dataclasses import asdict
 from .Normalization import RMSNorm, InstanceNorm, RevIN
 from .TransformerModel import FeedForward, ConvFeedForward, DwConvFeedForward, FANLayer, FANFeedForward
@@ -39,6 +40,42 @@ def round_channels(channels, width_mult=1, divisor=8, min_value=None):
 
 
 
+class PositionalEmbedding(nn.Module):
+    """
+    Implements the standard PE function as in https://arxiv.org/abs/1706.03762.
+    """
+
+    def __init__(self, block_size, d_model, base_val=10000.0) -> None:
+        super(PositionalEmbedding, self).__init__()
+        self.block_size= block_size
+        self.base_val= base_val
+
+        # create a long tensor of block_size positions
+        position= torch.arange(0, block_size).unsqueeze(1)
+        frequencies= torch.exp(
+            torch.arange(0, d_model, 2).float() * -(math.log(base_val) / d_model)
+        )
+        # create an empty placeholder
+        wpe= torch.zeros(block_size, d_model).float()
+        wpe.require_grad= False
+        # itterating over each element in the sequence using sin and cos
+        wpe[:, 0::2]= torch.sin(position * frequencies)
+        wpe[:, 1::2]= torch.cos(position * frequencies)
+        # register_buffer -- it is not saved in the state_dict nor optimized
+        self.register_buffer('wpe', wpe.unsqueeze(0), persistent=False)
+
+
+    def extra_repr(self):
+        return f"block_size={self.block_size}, base={self.base_val}"
+
+
+    def forward(self, x):
+        x= x + self.wpe[:, : x.size(1)].to(x.device)
+
+        return x
+
+
+
 class PatchMasking(nn.Module):
     """
     Applies random masking to the patch embeddings for self-supervised training tasks.
@@ -55,9 +92,17 @@ class PatchMasking(nn.Module):
         return f"mask_ratio={self.mask_ratio}"
 
 
-    def forward(self, x):
+    def forward(self, x, x_cross=None, has_cls_tk=False):
         if (not self.training) or self.mask_ratio== 0.0:
-            return x
+            return x, x_cross
+
+        if has_cls_tk:
+            # ensure the class token will not be masked
+            cls= x[:, 0, :]
+            x  = x[:, 1:, :]
+            if (x_cross is not None):
+                cls_cross= x_cross[:, 0, :]
+                x_cross  = x_cross[:, 1:, :]
 
         B, P, C= x.size()  # (batch_size, num_patches, d_model)
         # create a binary mask of shape (B, P): True means the patch is masked
@@ -65,7 +110,17 @@ class PatchMasking(nn.Module):
         # expand mask to match x dimensions (B, P, 1)
         mask= mask.unsqueeze(-1)
 
-        return x.masked_fill(mask, value=0.0)  # set masked positions to zero
+        # set masked positions to zero
+        x= x.masked_fill(mask, value=0.0)
+        if has_cls_tk:
+            x= torch.cat((cls.unsqueeze(1), x), dim=1)
+
+        if (x_cross is not None):
+            x_cross= x_cross.masked_fill(mask, value=0.0)
+            if has_cls_tk:
+                x_cross= torch.cat((cls_cross.unsqueeze(1), x_cross), dim=1)
+
+        return x, x_cross
 
 
 
@@ -86,9 +141,17 @@ class PatchMaskingMAE(nn.Module):
         return f"mask_ratio={self.mask_ratio}"
 
 
-    def forward(self, x):
+    def forward(self, x, x_cross=None, has_cls_tk=False):
         if (not self.training) or self.mask_ratio== 0.0:
-            return x, None, None
+            return x, x_cross, None, None
+
+        if has_cls_tk:
+            # ensure the class token will not be masked
+            cls= x[:, 0, :]
+            x  = x[:, 1:, :]
+            if (x_cross is not None):
+                cls_cross= x_cross[:, 0, :]
+                x_cross  = x_cross[:, 1:, :]
 
         B, P, C= x.size()  # (batch_size, num_patches, d_model)
         # determine the number of patches to keep
@@ -101,6 +164,15 @@ class PatchMaskingMAE(nn.Module):
         # keep the first subset
         ids_keep= ids_shuffle[:, :pto_keep]
         x_masked= torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
+        if has_cls_tk:
+            x_masked= torch.cat((cls.unsqueeze(1), x_masked), dim=1)
+
+        if (x_cross is not None):
+            x_cross_masked= torch.gather(x_cross, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
+            if has_cls_tk:
+                x_cross_masked= torch.cat((cls_cross.unsqueeze(1), x_cross_masked), dim=1)
+        else:
+            x_cross_masked= None
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask= torch.ones([B, P], device=x.device)
@@ -108,7 +180,7 @@ class PatchMaskingMAE(nn.Module):
         # unshuffle to get the binary mask
         mask= torch.gather(mask, dim=1, index=ids_restore)
 
-        return x_masked, mask, ids_restore
+        return x_masked, x_cross_masked, mask, ids_restore
 
 
 
@@ -745,15 +817,16 @@ class TSFTransformer(nn.Module):
     - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
     'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that
     can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - If rope_theta<=0, RoPE is disabled and the sinusoidal positional embedding is used.
     """
 
     def __init__(
-        self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
-        is_causal=False, forecasting=True, mask_ratio=0., mask_type='mae', n_layer=6, d_model=256, block_size=672,
-        n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
-        diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-        output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
-        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0.
+            self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
+            is_causal=False, forecasting=True, mask_ratio=0., mask_type='mae', n_layer=6, d_model=256, block_size=672,
+            n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
+            diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
+            output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
+            use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., cls_token=False
     ) -> None:
         super(TSFTransformer, self).__init__()
         assert patch_width > 0, "patch_width must be greater than zero"
@@ -776,7 +849,7 @@ class TSFTransformer(nn.Module):
         self.n_outputs= int(n_outputs)
         self.is_causal= is_causal
         # ensure mask_ratio is only available for Encoders
-        mask_ratio= mask_ratio if not is_causal else 0.0
+        mask_ratio= mask_ratio if (not is_causal) else 0.0
         # ensure forecasting mode for Encoders under no SSL objective
         self.forecasting= forecasting if mask_ratio == 0.0 else False
         # ensure forecasting mode for Decoders
@@ -792,29 +865,38 @@ class TSFTransformer(nn.Module):
         self.input_norm= InstanceNorm(dim2reduce=-1, eps=1e-5) if use_input_norm else None
         #self.input_norm= RevIN(channels, eps=1e-5) if use_input_norm else None
 
-        self.config= BaseConfig(
-            self.patch_width, channels, self.n_outputs, self.width_factor, multi_modal,
-            self.is_causal, self.forecasting, mask_ratio, mask_type, n_layer, d_model, self.block_size,
-            n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, flash_attn, diff_attn,
-            ffn_type, glu, n_experts, top_k_experts, experts_type, output_head_type, fine_tune,
-            unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout
-        )
-
         # define the patch embedding for converting TS tokens
         if emb_norm_type == 'rms':
             self.t_embedding= PatchEmbeddingV3(self.patch_width, channels, d_model, dropout)
         else:
             self.t_embedding= PatchEmbedding(self.patch_width, channels, d_model, dropout)
-        # define SSL patch masking with a mask_ratio (Encoder-only)
-        if mask_ratio > 0.0:
-            self.mask_layer= PatchMaskingMAE(mask_ratio) if mask_type == 'mae' else PatchMasking(mask_ratio)
-        else:
-            self.mask_layer= None
         # define the patch embedding for exogenous calendar covariates
         if multi_modal:
             self.c_embedding= MultiModalEmbedding(self.patch_width, channels, d_model, dropout, emb_norm_type)
         else:
             self.c_embedding= None
+
+        # define CLS token as a learnable parameter and initialize it with normal distributions
+        if cls_token:
+            self.cls_token= nn.Parameter(torch.randn(1, 1, d_model))
+            nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+            patch_dim= patch_dim + 1
+        else:
+            self.cls_token= None
+
+        # define SSL patch masking with a mask_ratio (Encoder-only)
+        if mask_ratio > 0.0 and mask_type == 'mae':
+            rope_theta= 0.0
+            self.mask_layer= PatchMaskingMAE(mask_ratio)
+        elif mask_ratio > 0.0:
+            self.mask_layer= PatchMasking(mask_ratio)
+        else:
+            self.mask_layer= None
+
+        if rope_theta <= 0.0:
+            self.pos_emb= PositionalEmbedding(patch_dim, d_model)
+        else:
+            self.pos_emb= None
 
         # define the backbone transformer model
         self.backbone= TransformerModel(
@@ -823,8 +905,10 @@ class TSFTransformer(nn.Module):
             experts_type, bias, rope_theta
         )
 
+        patch_dim= patch_dim - 1 if cls_token else patch_dim
         # identity transformation (no change to the tensor)
         self.latent_space= nn.Identity()
+
         # define the final head according to the model and task objective
         if is_causal:
             self.head= DecoderHead(
@@ -844,6 +928,14 @@ class TSFTransformer(nn.Module):
                     output_head_dropout, output_head_type, bias, fine_tune, unpatch
                 )
         self.set_horizon(self.forecast_lst)
+
+        self.config= BaseConfig(
+            self.patch_width, channels, self.n_outputs, self.width_factor, multi_modal,
+            self.is_causal, self.forecasting, mask_ratio, mask_type, n_layer, d_model, self.block_size,
+            n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, flash_attn, diff_attn,
+            ffn_type, glu, n_experts, top_k_experts, experts_type, output_head_type, fine_tune,
+            unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout, cls_token
+        )
 
 
     @classmethod
@@ -973,7 +1065,7 @@ class TSFTransformer(nn.Module):
         self.eval()
         try:
             for i in range(n_patches):
-                logits, _= self.forward(ts, 0, ts_mark=ts_mark)
+                logits, *_= self.forward(ts, 0, ts_mark=ts_mark)
                 if end_f_patch_width > 0:
                     future= logits[:, :, -f_patch_width:-end_f_patch_width]
                 else:
@@ -1017,38 +1109,64 @@ class TSFTransformer(nn.Module):
 
         x= self.t_embedding(ts)  # (B * C, P, d_model)
 
-        # patch masking when in SSL mode
-        mask, ids_restore= None, None
-        if self.mask_layer is not None:
-            if isinstance(self.mask_layer, PatchMaskingMAE):
-                x, mask, ids_restore= self.mask_layer(x)
-            else:
-                x= self.mask_layer(x)
+        has_cls_tk= False
+        if self.cls_token is not None:
+            has_cls_tk= True
+            # repeat a class token (CLS) for each sequence in the batch
+            cls_tk= repeat(self.cls_token, '1 1 d -> b 1 d', b=B*C)
+            # append CLS tokens with patch embeddings
+            x= torch.cat((cls_tk, x), dim=1)  # (B * C, 1+P, d_model)
+
+        if self.pos_emb is not None:
+            x= self.pos_emb(x)
 
         # embed covariates (if any) to forward it into the cross-attention modules
         if (self.c_embedding is not None) and (ts_mark is not None):
             x_cross= self.c_embedding(ts_mark, ts)  # (B * C, P, d_model)
+
+            if self.cls_token is not None:
+                # repeat a CLS token also for each sequence in cross-attention modules
+                cross_cls_tk= repeat(self.cls_token, '1 1 d -> b 1 d', b=B*C)
+                # append CLS tokens with covariate patch embeddings
+                x_cross= torch.cat((cross_cls_tk, x_cross), dim=1)  # (B * C, 1+P, d_model)
+
+            if self.pos_emb is not None:
+                x_cross= self.pos_emb(x_cross)
         else:
             x_cross= None
+
+        # patch masking when in SSL mode
+        mask, ids_restore= None, None
+        if self.mask_layer is not None:
+            if isinstance(self.mask_layer, PatchMaskingMAE):
+                x, x_cross, mask, ids_restore= self.mask_layer(x, x_cross, has_cls_tk)
+            else:
+                x, x_cross= self.mask_layer(x, x_cross, has_cls_tk)
 
         # forward the embeddings through the transformer
         x, router_logits= self.backbone(x, x_cross, start_pos, inference)
 
         if self.is_causal or self.forecasting or (self.mask_layer is not None):
             # full feature map (representing individual patch embeddings)
-            out= self.latent_space(x)  # (B * C, P, d_model)
+            ft_map= x[:, 1:] if (self.cls_token is not None) else x
+            out= self.latent_space(ft_map)  # (B * C, P, d_model)
         else:
-            # out receives a class token for classification tasks only (encoder and no SSL head)
-            # for every example in the batch, extract the mean patch as class token
-            out= self.latent_space(x.reshape(B, C, -1, x.shape[-1]).mean(dim=2))  # (B, C, d_model)
+            # out receives the class token for classification tasks only (encoder and no SSL head)
+            cls_tk= x[:, 0] if (self.cls_token is not None) else x.mean(dim=1)
+            out= self.latent_space(cls_tk.reshape(B, C, -1))  # (B, C, d_model)
         # the output head generates logits according to the task
         logits= self.head(out)
 
+        cls_tk= x[:, 0] if (self.cls_token is not None) else None
+
         if (mask is not None) and (ids_restore is not None):
-            return logits, router_logits, mask, ids_restore
+            return logits, router_logits, cls_tk, mask, ids_restore
 
         if (self.input_norm is not None) and logits.ndim == ts.ndim:
             logits= self.input_norm(logits, 'denorm')
+
+        if cls_tk is not None:
+            return logits, router_logits, cls_tk
 
         return logits, router_logits
 
