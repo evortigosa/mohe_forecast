@@ -15,7 +15,7 @@ class BaseConfig:
     - channels (int): Default is 1. Defines the number of channels (features/time series).
     - n_outputs (int): Default is 96. Defines the forecasting horizon.
     - width_factor (float): Default is 1.5. Defines the output horizon as multiple of patch_width.
-    - multi_modal (bool): Default is True. Enables the cross-attention module for covariate injection.
+    - multi_modal (bool|None): Default is True. Enables the cross-attention module for covariate injection.
     - is_causal (bool): Default is False. Encoder Transformer (False) or Decoder Transformer (True).
     - forecasting (bool): Default is True. Defines the model as a forecaster.
     - mask_ratio (float): Default is 0. Enables representation learning.
@@ -42,7 +42,7 @@ class BaseConfig:
     - bias (bool): Default is False. Enables bias for all learning modules.
     - rope_theta (float): Default is 10000.0. RoPE base value
     - use_input_norm (bool): Default is True. Enables an "online" normalization from Non-stationary Transformer.
-    - emb_norm_type (str): Default is 'layer'. This can be 'layer', 'rms'.
+    - emb_norm_type (str|None): Default is 'layer'. This can be 'layer', 'rms', or None.
     - output_head_dropout (float): Default is 0. Dropout before unpatching head.
     - cls_token (bool): Default is False. Enables an extra classification token.
     """
@@ -50,7 +50,7 @@ class BaseConfig:
     channels:int= 1
     n_outputs:int= 96
     width_factor:float= 1.5
-    multi_modal:bool= True         # enables the cross-attention module
+    multi_modal:bool|None= True    # enables the cross-attention module
     is_causal:bool= False          # Encoder Transformer (False) or Decoder Transformer (True)
     forecasting:bool= True
     mask_ratio:float= 0.           # enables representation learning
@@ -77,7 +77,7 @@ class BaseConfig:
     bias:bool= False               # enables bias for all learning modules
     rope_theta:float= 10000.0      # RoPE base value
     use_input_norm:bool= True      # "online" normalization from Non-stationary Transformer
-    emb_norm_type:str= 'layer'     # layer, rms
+    emb_norm_type:str|None= 'layer'  # layer, rms
     output_head_dropout:float= 0.  # dropout before unpatching
     cls_token:bool= False
 

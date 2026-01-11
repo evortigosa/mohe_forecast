@@ -499,7 +499,11 @@ class EmbeddingDecoderMAE(nn.Module):
         torch.nn.init.normal_(self.mask_token, std=.02)
 
 
-    def forward(self, x, ids_restore):
+    def forward(self, x, ids_restore, cls_token=None):
+        if cls_token is not None:
+            self.has_cls_tk= True
+            x= torch.cat([cls_token.unsqueeze(1), x], dim=1)
+
         # embed tokens to decoder d_model
         x= self.decoder_embed(x)
         # append mask tokens to sequence
@@ -869,12 +873,12 @@ class TSFTransformer(nn.Module):
     """
 
     def __init__(
-            self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
-            is_causal=False, forecasting=True, mask_ratio=0., mask_type='mae', n_layer=6, d_model=256, block_size=672,
-            n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
-            diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-            output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
-            use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., cls_token=False
+        self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
+        is_causal=False, forecasting=True, mask_ratio=0., mask_type='mae', n_layer=6, d_model=256, block_size=672,
+        n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
+        diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
+        output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
+        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., cls_token=False
     ) -> None:
         super(TSFTransformer, self).__init__()
         assert patch_width > 0, "patch_width must be greater than zero"
@@ -886,13 +890,13 @@ class TSFTransformer(nn.Module):
         assert self.block_size >= self.patch_width, \
             f"block_size ({self.block_size}) must be greater than or equal to patch_width ({self.patch_width})"
         # standardize text-based hyperparameters
-        norm_type= norm_type.lower()
-        emb_norm_type= emb_norm_type.lower()
         mask_type= mask_type.lower()
+        norm_type= norm_type.lower()
         ffn_type= ffn_type.lower()
         experts_type= experts_type.lower()
         output_head_type= output_head_type.lower()
         unpatch= unpatch.lower()
+        emb_norm_type= emb_norm_type.lower() if isinstance(emb_norm_type, str) else emb_norm_type
 
         self.n_outputs= int(n_outputs)
         self.is_causal= is_causal
@@ -910,16 +914,22 @@ class TSFTransformer(nn.Module):
         self.forecast_fst= 0
         self.forecast_lst= 0
         # "online" normalization to help the model focus on residual dynamics
+        use_input_norm = use_input_norm and (emb_norm_type is not None) and not (mask_ratio > 0.0 and mask_type == 'mae')
         self.input_norm= InstanceNorm(dim2reduce=-1, eps=1e-5) if use_input_norm else None
         #self.input_norm= RevIN(channels, eps=1e-5) if use_input_norm else None
 
         # define the patch embedding for converting TS tokens
-        if emb_norm_type == 'rms':
+        if emb_norm_type is None:
+            self.t_embedding= nn.Identity()  # enable custom, external input embeddings
+        elif emb_norm_type == 'rms':
             self.t_embedding= PatchEmbeddingV3(self.patch_width, channels, d_model, dropout)
         else:
             self.t_embedding= PatchEmbedding(self.patch_width, channels, d_model, dropout)
         # define the patch embedding for exogenous calendar covariates
-        if multi_modal:
+        if multi_modal is None:
+            self.c_embedding= nn.Identity()  # enable custom, external covariate embeddings
+        elif multi_modal:
+            emb_norm_type= 'rms' if emb_norm_type is None else emb_norm_type
             self.c_embedding= MultiModalEmbedding(self.patch_width, channels, d_model, dropout, emb_norm_type)
         else:
             self.c_embedding= None
@@ -1145,7 +1155,11 @@ class TSFTransformer(nn.Module):
         return "--- Encoder-only model ---"
 
 
-    def forward(self, ts, start_pos=0, ts_mark=None):
+    def forward(self, ts, start_pos=0, ts_mark=None, ext_cls_token=None):
+        """
+        - ts_mark is an optional input for exogenous covariates.
+        - ext_cls_token is an optional input for an external CLS token.
+        """
         B, C, T= ts.size()  # ts (batch_size, channels/features, seq_length)
         assert T <= self.block_size, \
             f'Cannot forward sequence of length {T}, time window is only {self.block_size}'
@@ -1192,18 +1206,20 @@ class TSFTransformer(nn.Module):
         # forward the embeddings through the transformer
         x, router_logits= self.backbone(x, x_cross, start_pos, inference)
 
+        has_cls_tk= (self.cls_token is not None) or (ext_cls_token is not None)
+
         if self.is_causal or self.forecasting or (self.mask_layer is not None):
             # full feature map (representing individual patch embeddings)
-            ft_map= x[:, 1:] if (self.cls_token is not None) else x
+            ft_map= x[:, 1:] if has_cls_tk else x
             out= self.latent_space(ft_map)  # (B * C, P, d_model)
         else:
             # out receives the class token for classification tasks only (encoder and no SSL head)
-            cls_tk= x[:, 0] if (self.cls_token is not None) else x.mean(dim=1)
+            cls_tk= x[:, 0] if has_cls_tk else x.mean(dim=1)
             out= self.latent_space(cls_tk.reshape(B, C, -1))  # (B, C, d_model)
         # the output head generates logits according to the task
         logits= self.head(out)
 
-        cls_tk= x[:, 0] if (self.cls_token is not None) else None
+        cls_tk= x[:, 0] if has_cls_tk else None
 
         if (mask is not None) and (ids_restore is not None):
             return logits, router_logits, cls_tk, mask, ids_restore
