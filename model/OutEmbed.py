@@ -6,13 +6,31 @@
 import torch
 import torch.nn as nn
 from .TransformerModel import FeedForward, ConvFeedForward, DwConvFeedForward, FANLayer, FANFeedForward
-from .InEmbed import round_channels
 
 
 
 """
 # Output Modules
 """
+
+
+def round_channels(channels, width_mult=1, divisor=8, min_value=None):
+    """
+    Round number of channels based on width multiplier.
+    Ensure that all layers have a channel number that is divisible by 'divisor'.
+    - This helps with efficient hardware utilization.
+    """
+    if min_value is None:
+        min_value= divisor
+
+    new_channels= channels * width_mult
+    new_channels= max(min_value, int(new_channels + divisor / 2) // divisor * divisor)
+    # Prevent rounding down by more than 10%
+    if new_channels < 0.9 * channels:
+        new_channels += divisor
+
+    return int(new_channels)
+
 
 
 class OutputBlock(nn.Module):
