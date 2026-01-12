@@ -457,7 +457,7 @@ class MultiModalEmbedding(nn.Module):
 class EmbeddingDecoderMAE(nn.Module):
     """
     Expand the input for a Masked Autoencoder (MAE) style decoder. Only the visible patches are
-    keep by a MAE style encoder model. This module places random tokens in the masked positions
+    keep by a MAE style encoder model. This module places zero tokens at the masked positions
     to feed the MAE style decoder.
     Adapted from https://arxiv.org/abs/2111.06377
     """

@@ -52,7 +52,7 @@ If you find this repo helpful, please cite our paper.
 ```
 
 ## Acknowledgement
-We appreciate the following GitHub repos a for their valuable efforts:
+We appreciate the following GitHub repos for their valuable efforts:
 
 Stationary (https://github.com/thuml/Nonstationary_Transformers)
 
