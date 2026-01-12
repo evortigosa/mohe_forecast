@@ -377,7 +377,8 @@ class DifferentialAttention(nn.Module):
         self.diff_norm= RMSNorm(2 * d_head)
 
 
-    def lambda_init_fn(self, depth):
+    @staticmethod
+    def lambda_init_fn(depth):
         return 0.8 - 0.6 * math.exp(-0.3 * depth)
 
 
@@ -887,9 +888,6 @@ class MoEFeedForward(nn.Module):
             self.experts= None
             self.top_k= 0
         else:
-            # controls contribution from fallback expert
-            self.shared_gating= nn.Linear(d_model, 1, bias=False)
-
             assert top_k > 0, "top_k must be > 0"
             self.top_k= min(top_k, n_experts)
 
@@ -900,6 +898,9 @@ class MoEFeedForward(nn.Module):
                     "experts_type must be a list of strings"
                 assert len(experts_type) >= n_experts, \
                     "experts_type must be a string or a list of length n_experts"
+
+            # controls contribution from fallback expert
+            self.shared_gating= nn.Linear(d_model, 1, bias=False)
 
             # n_experts routed expert modules
             self.experts= nn.ModuleList([
