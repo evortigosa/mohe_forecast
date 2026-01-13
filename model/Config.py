@@ -44,6 +44,8 @@ class BaseConfig:
     - use_input_norm (bool): Default is True. Enables an "online" normalization from Non-stationary Transformer.
     - emb_norm_type (str|None): Default is 'layer'. This can be 'layer', 'rms', or None.
     - output_head_dropout (float): Default is 0. Dropout before unpatching head.
+    - use_qk_norm (bool): Default is False. Enables the QK functional RMSNorm after RoPE.
+    - headwise_attn_gate (bool): Default is False. Enables headwise attention gate.
     - cls_token (bool): Default is False. Enables an extra classification token.
     """
     patch_width:int= 16
@@ -79,6 +81,8 @@ class BaseConfig:
     use_input_norm:bool= True      # "online" normalization from Non-stationary Transformer
     emb_norm_type:str|None= 'layer'  # layer, rms
     output_head_dropout:float= 0.  # dropout before unpatching
+    use_qk_norm:bool= False
+    headwise_attn_gate:bool= False
     cls_token:bool= False
 
 

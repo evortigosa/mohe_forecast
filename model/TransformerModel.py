@@ -711,13 +711,14 @@ class TransformerBlock(nn.Module):
     def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6,
                  d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
                  ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-                 bias=False, rope_theta=10000.0) -> None:
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False) -> None:
         super(TransformerBlock, self).__init__()
 
         # Self-Attention module to endogenous series
         self.norm1= self.get_norm(norm_type, d_model, init_alpha=0.6)
         self.s_att= MultiHeadedAttention(
-            depth, d_model, block_size, n_heads, n_kv_heads, dropout, diff_attn, bias, rope_theta
+            depth, d_model, block_size, n_heads, n_kv_heads, dropout, diff_attn, bias, rope_theta,
+            use_qk_norm, headwise_attn_gate
         )
         self.drop_path1= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
@@ -725,7 +726,8 @@ class TransformerBlock(nn.Module):
         if multi_modal:
             self.norm2= self.get_norm(norm_type, d_model, init_alpha=0.6)
             self.c_att= MultiHeadedAttention(
-                depth, d_model, block_size, n_heads, n_kv_heads, dropout, False, bias, rope_theta
+                depth, d_model, block_size, n_heads, n_kv_heads, dropout, False, bias, rope_theta,
+                use_qk_norm, headwise_attn_gate
             )
             self.drop_path2= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         else:
@@ -784,10 +786,12 @@ class TransformerModel(nn.Module):
     can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     """
 
-    def __init__(self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
-                 n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
-                 diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2,
-                 experts_type='fan', bias=False, rope_theta=10000.0) -> None:
+    def __init__(
+        self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
+        n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
+        diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2,
+        experts_type='fan', bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False
+    ) -> None:
         super(TransformerModel, self).__init__()
         # block_size represents the max sequence length
         self.block_size= block_size
@@ -809,7 +813,7 @@ class TransformerModel(nn.Module):
             TransformerBlock(
                 multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout,
                 sdp_rates[depth], norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-                experts_type, bias, rope_theta
+                experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate
             ) for depth in range(n_layer)
         ])
         # final normalization layer after the last TransformerBlock

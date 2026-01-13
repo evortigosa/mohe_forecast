@@ -50,7 +50,8 @@ class TSFTransformer(nn.Module):
         n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
         diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
         output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
-        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., cls_token=False
+        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False,
+        cls_token=False
     ) -> None:
         super(TSFTransformer, self).__init__()
         assert patch_width > 0, "patch_width must be greater than zero"
@@ -132,7 +133,7 @@ class TSFTransformer(nn.Module):
         self.backbone= TransformerModel(
             multi_modal, is_causal, n_layer, d_model, patch_dim, n_heads, n_kv_heads, d_ff, dropout,
             drop_path, norm_type, flash_attn, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-            experts_type, bias, rope_theta
+            experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate
         )
 
         patch_dim= patch_dim - 1 if cls_token else patch_dim
@@ -164,7 +165,8 @@ class TSFTransformer(nn.Module):
             self.is_causal, self.forecasting, mask_ratio, mask_type, n_layer, d_model, self.block_size,
             n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, flash_attn, diff_attn,
             ffn_type, glu, n_experts, top_k_experts, experts_type, output_head_type, fine_tune,
-            unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout, cls_token
+            unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout, use_qk_norm,
+            headwise_attn_gate, cls_token
         )
 
 
