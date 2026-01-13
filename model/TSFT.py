@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 # The Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts (MoHE) Model
+The MoHETS Model
 """
 
 import math

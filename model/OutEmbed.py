@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 # The Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts (MoHE) Model
+Output Embedding Modules
 """
 
 import torch
 import torch.nn as nn
-from .TransformerModel import FeedForward, ConvFeedForward, DwConvFeedForward, FANLayer, FANFeedForward
+from .MoHE import FeedForward, ConvFeedForward, DwConvFeedForward, FANLayer, FANFeedForward
 
 
 
