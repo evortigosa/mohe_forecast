@@ -60,16 +60,15 @@ class Trainer:
         """
         Train the model for one epoch, returning the training loss and learning rate.
         """
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
         self.model.train()
         train_loss= 0.0
+        n_samples= 0
+        n_steps= 0
         epoch_lr= 0.0
 
         # --- training steps ---
         for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}"):
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
             if self.use_time_features:
@@ -97,12 +96,8 @@ class Trainer:
 
             # check loss finite
             if not torch.isfinite(loss).all():
-                any_nonfinite_loss= True
                 # best to raise early to see where it happened
                 raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
-
-            # sample‑weighted average loss
-            train_loss += float(loss.item()) * data.size(0)
 
             # --- backward pass to calculate the gradients ---
             loss.backward()
@@ -110,17 +105,23 @@ class Trainer:
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
+
+            # sample‑weighted average loss
+            train_loss += float(loss.item()) * data.size(0)
+            n_samples += data.size(0)
+
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
             epoch_lr += self.optimizer.param_groups[0]['lr']
+            n_steps += 1
 
         if self.augmentation is not None:
             self.augmentation.step_epoch()
-        # transform per-step values in per-epoch averages
-        train_loss /= len(self.train_loader)
-        epoch_lr /= len(self.train_loader)
+
+        train_loss= train_loss / n_samples
+        epoch_lr  = epoch_lr / n_steps
 
         return train_loss, epoch_lr
 
@@ -130,17 +131,16 @@ class Trainer:
         Train the model for one epoch using bfloat16, returning the training loss and learning rate.
         """
         assert self.device.type == 'cuda', "BF16 training requires CUDA"
-        torch.cuda.empty_cache()
 
         self.model.train()
         train_loss= 0.0
+        n_samples= 0
+        n_steps= 0
         epoch_lr= 0.0
-        # track if any NaN/inf is observed
-        any_nonfinite_loss= False
 
         # --- training steps ---
         for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}"):
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
             if self.use_time_features:
@@ -170,31 +170,34 @@ class Trainer:
 
             # check loss finite
             if not torch.isfinite(loss).all():
-                any_nonfinite_loss= True
                 # best to raise early to see where it happened
                 raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
 
-            # sample‑weighted average loss
-            train_loss += float(loss.item()) * data.size(0)
-
             # --- backward pass to calculate the gradients ---
-            # gradients computed in bfloat16, but accumulation and params remain TF32
+            # gradients computed in BF16, but accumulation and params remain TF32
+            # BF16 does not need loss scaling with torch.amp.GradScaler()
             loss.backward()
             #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
+
+            # sample‑weighted average loss
+            train_loss += float(loss.item()) * data.size(0)
+            n_samples += data.size(0)
+
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
             epoch_lr += self.optimizer.param_groups[0]['lr']
+            n_steps += 1
 
         if self.augmentation is not None:
             self.augmentation.step_epoch()
-        # transform per-step values in per-epoch averages
-        train_loss /= len(self.train_loader)
-        epoch_lr /= len(self.train_loader)
+
+        train_loss= train_loss / n_samples
+        epoch_lr  = epoch_lr / n_steps
 
         return train_loss, epoch_lr
 
@@ -203,12 +206,10 @@ class Trainer:
         """
         Validate the model on a validation set.
         """
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
         self.model.eval()
         val_criterion= val_criterion if val_criterion is not None else self.criterion
         val_loss= 0.0
+        n_samples= 0
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc='Validating'):
@@ -228,8 +229,9 @@ class Trainer:
                 loss= torch.mean(losses)
 
                 val_loss += float(loss.item()) * data.size(0)
+                n_samples+= data.size(0)
 
-        val_loss /= len(self.val_loader)
+        val_loss= val_loss / n_samples
 
         return val_loss
 
@@ -238,6 +240,9 @@ class Trainer:
         """
         Train the model for a specified number of epochs, performing validation and checkpointing.
         """
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
         best_val_loss= float('inf')
         best_epoch= -1
         val_loss= None
@@ -285,7 +290,7 @@ class Trainer:
 
         if val_loss is not None:
             print(f'Best Validation Loss: {best_val_loss:.4f} (Epoch {best_epoch + 1})')
-            # Save save a final checkpoint only if the last epoch equals the best epoch.
+            # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(epochs, best_val_loss)
 
@@ -311,6 +316,7 @@ class Trainer:
         self.model.eval()
         test_criterion= test_criterion if test_criterion is not None else self.criterion
         test_loss= 0.0
+        n_samples= 0
         all_logits, all_trues= [], []
 
         with torch.no_grad():
@@ -341,10 +347,11 @@ class Trainer:
 
                 # --- register preds and trues ---
                 test_loss += float(loss.item()) * data.size(0)
+                n_samples += data.size(0)
                 all_logits.append(logits.cpu())
                 all_trues.append(target.cpu())
 
-        test_loss /= len(test_loader)
+        test_loss= test_loss / n_samples
 
         return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
 

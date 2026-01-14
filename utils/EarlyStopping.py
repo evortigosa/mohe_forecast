@@ -13,7 +13,7 @@ class EarlyStopping:
     Early stopping utility to terminate training when the loss does not improve sufficiently.
     """
 
-    def __init__(self, patience=7, min_delta=1e-4, mode="min", verbose=True):
+    def __init__(self, patience=7, min_delta=1e-6, mode="min", verbose=True):
         assert patience >= 0, "patience must be non-negative"
         assert min_delta >= 0, "min_delta must be non-negative"
         assert mode in ("min", "max"), "mode must be 'min' or 'max'"
