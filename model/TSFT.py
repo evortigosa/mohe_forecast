@@ -434,7 +434,7 @@ class TSFTransformer(nn.Module):
         use_fused= fused_available and device.type == 'cuda'
         # create a AdamW PyTorch optimizer -- bug fix of Adam
         optimizer= torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas, eps=1e-8, fused=use_fused
+            optim_groups, lr=learning_rate, betas=betas, eps=1e-10, fused=use_fused
         )
         if verbose:
             print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params} parameters")
