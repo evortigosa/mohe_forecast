@@ -332,7 +332,7 @@ class TSFTransformer(nn.Module):
     def forward(self, ts, start_pos=0, ts_mark=None, ext_cls_token=None):
         """
         - ts_mark is an optional input for exogenous covariates.
-        - ext_cls_token is an optional input for an external CLS token.
+        - ext_cls_token (optional) input that informs the model that it has an external CLS token (MAE decoder)
         """
         B, C, T= ts.size()  # ts (batch_size, channels/features, seq_length)
         assert T <= self.block_size, \
