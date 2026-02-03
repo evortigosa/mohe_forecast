@@ -1,13 +1,13 @@
-# ModelName
+# MoHETS
 
-This repo is the official implementation for the paper: [ModelName: Long-term Time Series Forecasting with Mixture-of-Heterogeneous-Experts](https://arxiv.org/abs/0000.00000).
+This repo is the official implementation for the paper: [MoHETS: Long-term Time Series Forecasting with Mixture-of-Heterogeneous-Experts](https://arxiv.org/abs/2601.21866).
 
 ## Introduction
-In this paper, we introduce ModelName, an encoder-only time-series forecasting model with a Mixture-of-Heterogeneous-Experts (MoHE) architecture, where specialized expert modules capture periodicity and seasonal patterns, enabling state-of-the-art performance in long-horizon multivariate forecasting tasks. MoHE combines heterogeneous experts at both the
-sequence and patch levels, enhancing specialization while maintaining the scaling benefits observed in standard MoEs to improve computational efficiency and accuracy. We also incorporate a multimodal cross-attention mechanism that integrates external information from exogenous covariates. With this design, ModelName enhances time series representations by capturing interactions between endogenous features and exogenous information.
+In this paper, we introduce MoHETS, an encoder-only time-series forecasting model with a Mixture-of-Heterogeneous-Experts (MoHE) architecture, where specialized expert modules capture periodicity and seasonal patterns, enabling state-of-the-art performance in long-horizon multivariate forecasting tasks. MoHE combines heterogeneous experts at both the
+sequence and patch levels, enhancing specialization while maintaining the scaling benefits observed in standard MoEs to improve computational efficiency and accuracy. We also incorporate a multimodal cross-attention mechanism that integrates external information from exogenous covariates. With this design, MoHETS enhances time series representations by capturing interactions between endogenous features and exogenous information.
 
 ## Overall Architecture
-ModelName: an encoder-only transformer for multivariate time-series forecasting. (a) The input embedding module splits time channels into sequences of channel-independent patch embeddings. (b) The exogenous embedding module projects, fuses, and patches covariates with the input series to produce aligned exogenous patch embeddings. These patches are processed through B stacked Transformer blocks; each block is composed of self-attention, cross-attention, and a (c) Mixture-of-Heterogeneous-Experts (MoHE) layer for conditional, sparsely-activated computation. (d) The patch decoder head projects final embeddings to forecasting horizons.
+MoHETS: an encoder-only transformer for multivariate time-series forecasting. (a) The input embedding module splits time channels into sequences of channel-independent patch embeddings. (b) The exogenous embedding module projects, fuses, and patches covariates with the input series to produce aligned exogenous patch embeddings. These patches are processed through B stacked Transformer blocks; each block is composed of self-attention, cross-attention, and a (c) Mixture-of-Heterogeneous-Experts (MoHE) layer, where a shared depthwise-convolution expert maintains sequence continuity and routed Fourier experts resolve local spectral patterns. (d) The patch decoder head projects final embeddings to forecasting horizons.
 
 <p align="center">
 <img src=".\figures\model_architecture.png" width="900" height="" alt="" align=center />
@@ -31,7 +31,7 @@ pip install -r requirements.txt
 4. You can reproduce the experiment results by downloading our checkpoints from [[Google Drive]](https://drive.google.com/drive/folders/1C6OEebq9k9WLTFY4f69r2cTl6duGadvE?usp=sharing).
 
 ## Main Results
-We evaluate ModelName on long-term multivariate forecasting benchmarks. Comprehensive forecasting results demonstrate that ModelName effectively incorporates exogenous information to enhance the prediction of endogenous series.
+We evaluate MoHETS on long-term multivariate forecasting benchmarks. Comprehensive forecasting results demonstrate that MoHETS effectively incorporates exogenous information to enhance the prediction of endogenous series.
 
 ### Full-shot Forecasting
 
@@ -43,11 +43,11 @@ We evaluate ModelName on long-term multivariate forecasting benchmarks. Comprehe
 If you find this repo helpful, please cite our paper.
 
 ```
-@article{xxxx,
-  title={ModelName: Long-term Time Series Forecasting with Mixture-of-Heterogeneous-Experts},
-  author={Evandro S. Ortigossa, ..., Eran Segal},
-  journal={xxxx},
-  year={xxxx}
+@article{ortigossa2026mohets,
+  title={{MoHETS}: Long-term Time Series Forecasting with Mixture-of-Heterogeneous-Experts},
+  author={Ortigossa, Evandro S. and Lutsker, Guy and Segal, Eran},
+  journal={arXiv preprint arXiv:2601.21866},
+  year={2026}
 }
 ```
 
