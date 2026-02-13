@@ -15,7 +15,7 @@ ETT DataLoaders
 """
 
 
-def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, btc_size,
+def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, from_csv, btc_size,
                          time_covariates, patch_width, block_size, out_width):
     """
     Create DataLoader objects for ETTx1, ETTx2, and combined datasets for encoder/decoder training
@@ -23,6 +23,7 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, btc_size
     Args:
     - ett_root_path (str): Directory path for dataset files.
     - dataset_name_1, dataset_name_2 (str): Filenames (e.g., 'ETTh1.csv', 'ETTh2.csv').
+    - from_csv (bool): Whether to read data from CSV files or neuralforecast's LongHorizon.
     - btc_size (int): Batch size.
     - time_covariates (bool): Use time features.
     - patch_width (int): Length of each patch.
@@ -39,22 +40,22 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, btc_size
     dec_size_tv= [INPUT_WIDTH, HISTORY_TAIL, OUTPUT_WIDTH]
 
     dec_train_ds_ett_1= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='train', size=dec_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='train', size=dec_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     dec_val_ds_ett_1= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='val', size=dec_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='val', size=dec_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     dec_tds_scaler_1= dec_train_ds_ett_1.scaler
 
 
     dec_train_ds_ett_2= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='train', size=dec_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='train', size=dec_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     dec_val_ds_ett_2= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='val', size=dec_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='val', size=dec_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     dec_tds_scaler_2= dec_train_ds_ett_2.scaler
@@ -66,22 +67,22 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, btc_size
     enc_size_tv= [INPUT_WIDTH, E_HISTORY_TAIL, E_OUTPUT_WIDTH]
 
     enc_train_ds_ett_1= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='train', size=enc_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='train', size=enc_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     enc_val_ds_ett_1= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='val', size=enc_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='val', size=enc_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     enc_tds_scaler_1= enc_train_ds_ett_1.scaler
 
 
     enc_train_ds_ett_2= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='train', size=enc_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='train', size=enc_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     enc_val_ds_ett_2= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='val', size=enc_size_tv,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='val', size=enc_size_tv,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     enc_tds_scaler_2= enc_train_ds_ett_2.scaler
@@ -93,44 +94,44 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, btc_size
     size_te_96= [INPUT_WIDTH, F_HISTORY_TAIL, 96]
 
     test_ds_ett_1_96= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='test', size=size_te_96,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='test', size=size_te_96,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     test_ds_ett_2_96= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='test', size=size_te_96,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='test', size=size_te_96,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
 
     size_te_192= [INPUT_WIDTH, F_HISTORY_TAIL, 192]
 
     test_ds_ett_1_192= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='test', size=size_te_192,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='test', size=size_te_192,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     test_ds_ett_2_192= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='test', size=size_te_192,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='test', size=size_te_192,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
 
     size_te_336= [INPUT_WIDTH, F_HISTORY_TAIL, 336]
 
     test_ds_ett_1_336= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='test', size=size_te_336,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='test', size=size_te_336,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     test_ds_ett_2_336= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='test', size=size_te_336,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='test', size=size_te_336,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
 
     size_te_720= [INPUT_WIDTH, F_HISTORY_TAIL, 720]
 
     test_ds_ett_1_720= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_1, from_csv=True, split='test', size=size_te_720,
+        root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='test', size=size_te_720,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
     test_ds_ett_2_720= Dataset_ETT(
-        root_path=ett_root_path, data_path=dataset_name_2, from_csv=True, split='test', size=size_te_720,
+        root_path=ett_root_path, data_path=dataset_name_2, from_csv=from_csv, split='test', size=size_te_720,
         features='MS', target='OT', scale=True, timeenc=1, use_time_features=time_covariates
     )
 
