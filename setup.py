@@ -12,5 +12,5 @@ setup(
     long_description_content_type='text/markdown',
     author='Evandro S. Ortigossa',
     url='https://github.com/evortigosa/mohe_forecast',
-    packages=find_packages(),
+    packages=find_packages(include=["mohe_forecast", "mohe_forecast.*"]),
 )
