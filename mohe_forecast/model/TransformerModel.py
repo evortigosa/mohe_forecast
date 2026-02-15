@@ -1,0 +1,864 @@
+# -*- coding: utf-8 -*-
+"""
+Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts (MoHE)
+The Transformer Architecture
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.layers import DropPath
+from einops import repeat
+from .Normalization import RMSNorm, DynamicTanh
+from .MoHE import MoEFeedForward
+
+
+
+"""
+Rotary Positional Encoding (RoPE)
+"""
+
+
+class QKRoPE(nn.Module):
+    """
+    The Rotary Positional Encoding (RoPE) functions for Query and Key embeddings.
+    It precomputes complex rotation factors (in polar form) and applies them to the Query and Key
+    embeddings after reshaping the last dimension into pairs.
+    - When theta<=0, no rotation is applied.
+    - Based on https://arxiv.org/abs/2407.21783
+    """
+
+    def __init__(self, d_head, block_size, theta=10000.0) -> None:
+        super(QKRoPE, self).__init__()
+        assert d_head % 2 == 0, "d_head must be even for RoPE"
+        self.block_size= block_size
+        self.theta= theta
+        # computing inverse frequencies for each pair in the head dimension in a register_buffer
+        self.register_buffer('inv_freq', 1.0 / (self.theta ** (
+            torch.arange(0, d_head, 2, dtype=torch.int64)[: (d_head // 2)].float() / d_head
+        )))
+
+
+    def extra_repr(self):
+        return f"block_size={self.block_size}, theta={self.theta}"
+
+
+    def precompute_freqs_cis(self, max_len, device):
+        """
+        Precompute the complex rotation factors for the given sequence length.
+        """
+        # computing positions vector
+        t= torch.arange(max_len, dtype=torch.int64, device=device).type_as(self.inv_freq)
+        # freqs gives all the angles for all the position of tokens in the sequence
+        freqs= torch.outer(t, self.inv_freq)
+        # the rotation matrix needs to be converted to complex numbers in polar form
+        freqs_cis= torch.polar(torch.ones_like(freqs), freqs)
+
+        return freqs_cis
+
+
+    @staticmethod
+    def reshape_for_broadcast(freqs_cis, x):
+        """
+        Reshape freqs_cis for broadcast to match the dimensions of x.
+        """
+        ndim= x.ndim
+        assert 0 <= 1 < ndim, "x should have at least 2 dimensions"
+        assert freqs_cis.shape == (x.shape[1], x.shape[-1]), \
+            "The last two dimension of freqs_cis and x must match"
+        # create a shape that has dimension 1 for all dims except dim1 (T) and last dim
+        shape= [d if i == 1 or i == ndim -1 else 1 for i, d in enumerate(x.shape)]
+
+        return freqs_cis.view(*shape)
+
+
+    def forward(self, q, k, start_pos, inference):
+        if self.theta <= 0.:
+            return q, k
+
+        B, T, _, _= q.shape  # shape (B, T, nh, dh)
+
+        if inference:
+            # compute rotation matrix for each position in the sequence
+            freqs_cis= self.precompute_freqs_cis(self.block_size * 2, q.device)
+            # during inference, we should only take the rotation matrix range from the current
+            # position of the tokens
+            freqs_cis= freqs_cis[start_pos : start_pos + T]
+        else:
+            # compute rotation matrix to Query and Key for training
+            freqs_cis= self.precompute_freqs_cis(self.block_size, q.device)
+            freqs_cis= freqs_cis[:T]
+
+        # applying rotary positional encoding to both Query and Key embedding together
+        # q/k_ci[B, T, n_(kv_)heads, dh/2] -- reshape last dimension into pairs
+        q_ci= torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+        k_ci= torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+
+        # reshape freqs_cis for broadcast to match the dimensions of x
+        freqs_cis= self.reshape_for_broadcast(freqs_cis, q_ci)
+
+        # q/k_out[B, T, n_(kv_)heads, dh]
+        q_out= torch.view_as_real(q_ci * freqs_cis).flatten(3)
+        k_out= torch.view_as_real(k_ci * freqs_cis).flatten(3)
+
+        return q_out.type_as(q), k_out.type_as(k)
+
+
+
+class QKRoPEv1(nn.Module):
+    """
+    --- Improved version - freqs in a non-persistent buffer ---
+    The Rotary Positional Encoding (RoPE) functions for Query and Key embeddings.
+    It precomputes complex rotation factors (in polar form) and applies them to the Query and Key
+    embeddings after reshaping the last dimension into pairs.
+    - When theta<=0, no rotation is applied.
+    - Based on https://arxiv.org/abs/2407.21783
+    """
+
+    def __init__(self, d_head, block_size, theta=10000.0) -> None:
+        super(QKRoPEv1, self).__init__()
+        assert d_head % 2 == 0, "d_head must be even for RoPE"
+        self.d_head= d_head
+        self.block_size= block_size
+        self.theta= theta
+        self.register_buffer("freqs_cis", None, persistent=False)
+
+
+    def extra_repr(self):
+        return f"block_size={self.block_size}, theta={self.theta}"
+
+
+    @staticmethod
+    def precompute_freqs_cis(max_len, d_head, theta, device):
+        """
+        Precompute the complex rotation factors for the given sequence length.
+        """
+        # computing inverse frequencies for each pair in the head dimension
+        inv_freq= 1.0 / (theta ** (
+            torch.arange(0, d_head, 2, dtype=torch.int64, device=device)[: (d_head // 2)].float() / d_head
+        ))
+        # computing positions vector
+        t= torch.arange(max_len, dtype=torch.int64, device=device).type_as(inv_freq)
+        # freqs gives all the angles for all the position of tokens in the sequence
+        freqs= torch.outer(t, inv_freq)
+        # the rotation matrix needs to be converted to complex numbers in polar form
+        freqs_cis= torch.polar(torch.ones_like(freqs), freqs)
+
+        return freqs_cis
+
+
+    def ensure_cache(self, max_len, device):
+        need_recompute= (
+            self.freqs_cis is None or self.freqs_cis.device != device
+            or self.freqs_cis.shape[0] < max_len
+        )
+        if need_recompute:
+            freqs_cis= self.precompute_freqs_cis(max_len, self.d_head, self.theta, device)
+            # register_buffer already created; assign
+            self.freqs_cis= freqs_cis
+
+
+    @staticmethod
+    def reshape_for_broadcast(freqs_cis, x):
+        """
+        Reshape freqs_cis for broadcast to match the dimensions of x.
+        """
+        ndim= x.ndim
+        assert ndim >= 2, "x should have at least 2 dimensions"
+        assert freqs_cis.shape == (x.shape[1], x.shape[-1]), \
+            "The last two dimension of freqs_cis and x must match"
+        # create a shape that has dimension 1 for all dims except dim1 (T) and last dim
+        shape= [d if i == 1 or i == ndim -1 else 1 for i, d in enumerate(x.shape)]
+
+        return freqs_cis.view(*shape)
+
+
+    def forward(self, q, k, start_pos=0, inference=False):
+        if self.theta <= 0.:
+            return q, k
+
+        B, T, _, _= q.shape  # shape (B, T, nh, dh)
+
+        rotary_seq_len= self.block_size * 4  # 4X over-compute should be enough
+        # compute rotation matrix for each position in the rotary sequence
+        self.ensure_cache(rotary_seq_len, q.device)
+
+        if inference:
+            # during inference, we should only take the rotation matrix range from the current
+            # position of the tokens
+            freqs_cis= self.freqs_cis[start_pos : start_pos + T]
+        else:
+            freqs_cis= self.freqs_cis[:T]
+
+        # applying rotary positional encoding to both Query and Key embedding together
+        # q/k_ci[B, T, n_(kv_)heads, dh/2] -- reshape last dimension into pairs
+        q_ci= torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+        k_ci= torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+
+        # reshape freqs_cis for broadcast to match the dimensions of x
+        freqs_cis= self.reshape_for_broadcast(freqs_cis, q_ci)
+
+        # q/k_out[B, T, n_(kv_)heads, dh]
+        q_out= torch.view_as_real(q_ci * freqs_cis).flatten(3)
+        k_out= torch.view_as_real(k_ci * freqs_cis).flatten(3)
+
+        return q_out.type_as(q), k_out.type_as(k)
+
+
+
+class QKRoPEv2(nn.Module):
+    """
+    The Rotary Positional Encoding (RoPE) functions for Query and Key embeddings.
+    This version precomputes rotation factors (in real trigonometric) and applies them to the
+    Query and Key embeddings.
+    - When theta<=0, no rotation is applied.
+    """
+
+    def __init__(self, d_head, block_size, theta=10000.0) -> None:
+        super(QKRoPEv2, self).__init__()
+        assert d_head % 2 == 0, "d_head must be even for RoPE"
+        self.d_head= d_head
+        self.block_size= block_size
+        self.theta= theta
+        self.register_buffer("cos", None, persistent=False)
+        self.register_buffer("sin", None, persistent=False)
+
+
+    def extra_repr(self):
+        return f"block_size={self.block_size}, theta={self.theta}"
+
+
+    @staticmethod
+    def precompute_cos_sin(max_len, d_head, theta, device, dtype=torch.float32):
+        """
+        Precompute the rotation factors for the given sequence length.
+        """
+        # stride the channels
+        channel_range= torch.arange(0, d_head, 2, dtype=dtype, device=device)
+        inv_freq= 1.0 / (theta ** (channel_range / d_head))
+        # stride the time steps
+        t= torch.arange(max_len, dtype=dtype, device=device)
+        # calculate the rotation frequencies at each (time, channel) pair
+        freqs= torch.outer(t, inv_freq)
+        cos, sin= freqs.cos(), freqs.sin()
+        # add batch and head dims for later broadcasting
+        cos, sin= cos[None, :, None, :], sin[None, :, None, :]
+
+        return cos, sin
+
+
+    def ensure_cache(self, max_len, device, dtype):
+        need_recompute= (
+            self.cos is None or self.cos.device != device or self.cos.dtype != dtype
+            or self.cos.shape[1] < max_len
+        )
+        if need_recompute:
+            cos, sin= self.precompute_cos_sin(max_len, self.d_head, self.theta, device, dtype)
+            # register_buffer already created; assign
+            self.cos= cos
+            self.sin= sin
+
+
+    @staticmethod
+    def apply_rotary_emb(x, cos, sin):
+        # multihead attention
+        assert x.ndim == 4, "x must be 4D: (batch, tokens, n_heads, d_head)"
+
+        d= x.shape[3] // 2
+        # split up last time into two halves
+        x1, x2= x[..., :d], x[..., d:]
+        # rotate pairs of dims
+        y1= x1 * cos + x2 * sin
+        y2= x1 * (-sin) + x2 * cos
+        # re-assemble
+        out= torch.cat([y1, y2], 3)
+        # ensure input/output dtypes match
+        out= out.to(x.dtype)
+
+        return out
+
+
+    def forward(self, q, k, start_pos=0, inference=False):
+        if self.theta <= 0.:
+            return q, k
+
+        B, T, _, _= q.shape  # shape (B, T, nh, dh)
+
+        rotary_seq_len= self.block_size * 4  # 4X over-compute should be enough
+        # compute rotation matrix for each position in the rotary sequence
+        self.ensure_cache(rotary_seq_len, q.device, q.dtype)
+
+        # truncate cache to current sequence length
+        T0= 0 if not inference else start_pos
+
+        assert T + T0 <= self.cos.size(1), \
+            f"Sequence length grew beyond the rotary embeddings cache: {T + T0} > {self.cos.size(1)}"
+
+        cos, sin= self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+        return self.apply_rotary_emb(q, cos, sin), self.apply_rotary_emb(k, cos, sin)
+
+
+
+""" 
+KV Cache
+"""
+
+
+class KVCache:
+    """
+    --- THIS IS A WIP ---
+    Implements a Key-Value Cache module for sliding-window time-series forecasting.
+    Based on in-place left-shifts, avoiding repeated concatenations or allocations.
+    """
+
+    def __init__(self, block_size, n_kv_heads, d_head) -> None:
+        self.block_size= block_size
+        self.n_kv_heads= n_kv_heads
+        self.d_head= d_head
+        self.is_empty= True
+        # None until init_cache is called
+        self.k_cache= None
+        self.v_cache= None
+        self.batch_size= None
+        self.device= None
+        self.dtype = None
+
+
+    def is_none(self) -> bool:
+        """
+        Check if caches are unallocated and update is_empty flag.
+        """
+        if self.k_cache is None or self.v_cache is None:
+            self.is_empty= True
+            return True
+        return False
+
+
+    def cache_validation(self, batch_size, n_heads, d_head, device, dtype) -> bool:
+        """
+        Verify and validate cache metadata.
+        """
+        if self.batch_size is None or self.device is None or self.dtype is None:
+            return False
+        if (batch_size != self.batch_size) or (n_heads != self.n_kv_heads) or (d_head != self.d_head):
+            return False
+        if (device != self.device) or (dtype != self.dtype):
+            return False
+        return True
+
+
+    def cache_invalidation(self) -> None:
+        """
+        Logically free the caches.
+        """
+        if not self.is_none():
+            self.k_cache.zero_()
+            self.v_cache.zero_()
+        self.is_empty= True
+
+
+    def alloc_buffers(self, batch_size, device, dtype) -> None:
+        """
+        Allocate internal buffers and set metadata.
+        """
+        self.batch_size= batch_size
+        self.device= device
+        self.dtype = dtype
+        shape= (self.batch_size, self.block_size, self.n_kv_heads, self.d_head)
+        # use zeros for deterministic memory
+        self.k_cache= torch.zeros(shape, device=self.device, dtype=self.dtype)
+        self.v_cache= torch.zeros(shape, device=self.device, dtype=self.dtype)
+        self.is_empty= True
+
+
+    def init_cache(self, k, v) -> None:
+        """
+        Initialize cache from a full context window.
+        """
+        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, T, n_heads, d_head)"
+        B, T, nh, dh= k.shape
+        assert T  == self.block_size, f"k length {T} must equal block_size {self.block_size}"
+        assert nh == self.n_kv_heads, f"n_kv_heads mismatch: {nh} vs {self.n_kv_heads}"
+
+        if not self.cache_validation(B, nh, dh, k.device, k.dtype):
+            # allocate new buffers when needed or metadata mismatch
+            self.alloc_buffers(B, k.device, k.dtype)
+        self.is_empty= False
+        # copy (detach incoming to avoid keeping graph)
+        self.k_cache.copy_(k.detach())
+        self.v_cache.copy_(v.detach())
+
+
+    def get_kv(self):
+        """
+        Return current caches (raises if empty).
+        """
+        if self.is_empty or self.is_none():
+            raise RuntimeError("KV Cache is empty.")
+        return self.k_cache, self.v_cache
+
+
+    def update(self, k, v):
+        """
+        Append T new KV vectors and drop the oldest T new (sliding window update).
+        """
+        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, T, n_heads, d_head)"
+        B, T_new, nh, dh= k.shape
+
+        if T_new > self.block_size:
+            raise ValueError(f"Sequence ({T_new}) cannot exceed block_size ({self.block_size})")
+
+        # nothing to do -> return current cache (or raise if empty)
+        if T_new == 0:
+            if self.is_empty or self.is_none():
+                raise RuntimeError("KV Cache is empty and no tokens provided.")
+            return self.k_cache, self.v_cache
+
+        # cache is empty -> initialize from a full context window.
+        if self.is_empty or self.is_none():
+            self.init_cache(k, v)
+            return self.k_cache, self.v_cache
+
+        # cache is not empty -> verify shapes / device
+        if not self.cache_validation(B, nh, dh, k.device, k.dtype):
+            raise RuntimeError("k shape/device/dtype must match existing cache metadata")
+
+        # shift left by T_new -> [:, :block_size - T_new, :, :]= [:, T_new:, :, :]
+        if T_new < self.block_size:
+            T_keep= self.block_size - T_new
+            self.k_cache[:, :T_keep, :, :].copy_(self.k_cache[:, T_new:, :, :].clone())
+            self.v_cache[:, :T_keep, :, :].copy_(self.v_cache[:, T_new:, :, :].clone())
+            # write new tokens at end
+            self.k_cache[:, T_keep:, :, :].copy_(k.detach())
+            self.v_cache[:, T_keep:, :, :].copy_(v.detach())
+        else:
+            # T_new == block_size -> full replace
+            self.k_cache.copy_(k.detach())
+            self.v_cache.copy_(v.detach())
+
+        return self.k_cache, self.v_cache
+
+
+
+"""
+Differential Attention
+"""
+
+
+class DifferentialAttention(nn.Module):
+    """
+    The Differential Attention Module.
+    Note that FlashAttention can be enabled on the fly through the setting of flash_attn in the
+    forward method.
+    - Based on https://arxiv.org/abs/2410.05258
+    """
+
+    def __init__(self, n_heads, d_head, depth, dropout_module) -> None:
+        super(DifferentialAttention, self).__init__()
+        self.d_head= d_head
+        # depth represents the current layer index
+        self.depth= depth
+        self.lambda_init= self.lambda_init_fn(depth)
+        # learnable vectors to compose the learnable lambda term
+        self.lambda_q1= nn.Parameter(torch.zeros((n_heads, d_head), dtype=torch.float32).normal_(mean=0.0, std=0.1))
+        self.lambda_k1= nn.Parameter(torch.zeros((n_heads, d_head), dtype=torch.float32).normal_(mean=0.0, std=0.1))
+        self.lambda_q2= nn.Parameter(torch.zeros((n_heads, d_head), dtype=torch.float32).normal_(mean=0.0, std=0.1))
+        self.lambda_k2= nn.Parameter(torch.zeros((n_heads, d_head), dtype=torch.float32).normal_(mean=0.0, std=0.1))
+
+        self.dropout= dropout_module
+        self.scaling= 1.0 / math.sqrt(d_head)
+        self.diff_norm= RMSNorm(2 * d_head)
+
+
+    @staticmethod
+    def lambda_init_fn(depth):
+        return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+
+    def extra_repr(self):
+        return f"depth={self.depth}, lambda_init={self.lambda_init}"
+
+
+    def forward(self, q, k, v, mask, flash_attn):
+        B, _, T, _= v.size()  # shape (B, nh, T, dh)
+
+        # lambda is derived from a composition of four learnable vectors
+        lambda_1= torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2= torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_final= lambda_1 - lambda_2 + self.lambda_init
+        # we extended lambda as a per head modulator
+        lambda_final= lambda_final.view(1, lambda_final.size(-1), 1, 1)
+        lambda_final= repeat(lambda_final, '1 d 1 1 -> b d 1 1', b=B)
+
+        if not flash_attn:
+            # Differential Attention
+            attn= (q @ k.transpose(-2, -1)) * self.scaling
+            # apply causal mask (when the mask is not None)
+            if mask is not None:
+                attn= attn.masked_fill(mask[:,:,:T,:T]== 0, float('-inf'))
+            # normalize Attention scores
+            attn= F.softmax(attn, dim=-1, dtype=torch.float32).type_as(attn)
+            # differential mechanism
+            attn= attn.view(B, -1, 2, T, T)
+            attn= attn[:, :, 0] - lambda_final * attn[:, :, 1]
+
+            attn= self.dropout(attn)
+            # compute Attention output
+            y= attn @ v  # (B, nh, T, dh)
+        else:
+            # Differential FlashAttention
+            q= q.reshape(B, -1, T, 2, self.d_head)
+            k= k.reshape(B, -1, T, 2, self.d_head)
+            # query and key matrices are split into two groups
+            q1, q2= q[:, :, :, 0], q[:, :, :, 1]
+            k1, k2= k[:, :, :, 0], k[:, :, :, 1]
+            # compute Attention using FlashAttention kernels
+            y1= F.scaled_dot_product_attention(
+                q1, k1, v, dropout_p=self.dropout.p, is_causal=mask
+            )
+            y2= F.scaled_dot_product_attention(
+                q2, k2, v, dropout_p=self.dropout.p, is_causal=mask
+            )
+            y= y1 - lambda_final * y2
+
+        # headwise norm to maintain training stability and scale
+        y= self.diff_norm(y)
+        y= y * (1 - self.lambda_init)
+
+        return y
+
+
+
+"""
+Group Query Multi-Headed Attention
+"""
+
+
+class MultiHeadedAttention(nn.Module):
+    """
+    The Group Query Multi-Headed Attention Module [RoPE, Group Query, and Gated Attention].
+    Note that FlashAttention can be enabled on the fly through the setting of flash_attn in the
+    forward method.
+    See https://arxiv.org/abs/2305.13245 and https://arxiv.org/abs/2505.06708
+    """
+
+    def __init__(self, depth, d_model, block_size, n_heads, n_kv_heads, dropout=0.2, diff_attn=False,
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False) -> None:
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model= d_model
+        self.n_heads= n_heads
+        # if n_kv_heads is None, use n_heads for key/value; else use provided value
+        self.n_kv_heads= n_heads if n_kv_heads is None else n_kv_heads
+        assert self.n_kv_heads <= n_heads, "n_kv_heads must be <= n_heads"
+        assert n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+        self.n_rep= n_heads // self.n_kv_heads
+        # when diff_attn is active, halve the effective head dimension for q and k (but not for v)
+        self.diff_factor= 1 if (not diff_attn) or headwise_attn_gate else 2
+        self.d_head = d_model // n_heads // self.diff_factor
+        self.scaling= 1.0 / math.sqrt(self.d_head)
+        self.use_qk_norm= use_qk_norm
+        self.headwise_attn_gate= headwise_attn_gate
+
+        # query, key, value projections
+        if headwise_attn_gate:
+            self.q_proj= nn.Linear(d_model, d_model + n_heads, bias=True)
+        else:
+            self.q_proj= nn.Linear(d_model, d_model, bias=True)
+        self.k_proj= nn.Linear(d_model, d_model // self.n_rep, bias=True)
+        self.v_proj= nn.Linear(d_model, d_model // self.n_rep, bias=True)
+        # Rotary Positional Encoding (RoPE) module
+        self.ropenc= QKRoPE(self.d_head, block_size, rope_theta)
+        # regularization
+        dropout_module= nn.Dropout(p=dropout)
+        # differential Attention module
+        self.diff_attn= None if self.diff_factor == 1 else DifferentialAttention(
+            n_heads, self.d_head, depth, dropout_module
+        )
+        self.dropout= dropout_module if (self.diff_attn is None) else None
+        # output projection
+        self.o_proj= nn.Linear(d_model, d_model, bias=bias)
+
+        # initialize Linear modules with Glorot / fan_avg
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+
+
+    @staticmethod
+    def norm(x):
+        """
+        Purely functional RMSNorm with no learnable params
+        """
+        return F.rms_norm(x, (x.size(-1),))
+
+
+    @staticmethod
+    def repeat_kv(x, n_rep):
+        """
+        Repeat Key or Value tensor along the head dimension to match the Query head count, i.e.,
+        if the number of Key/Value heads is less than Query heads, this function expands the
+        Key/Value embeddings with the required number of repetition
+        """
+        B, T, n_kv_heads, dh= x.shape
+
+        if n_rep== 1:
+            return x
+
+        return (
+            x[:, :, :, None, :].expand(
+                B, T,  n_kv_heads,  n_rep,  dh
+            ).reshape(
+                B, T, (n_kv_heads * n_rep), dh
+            )
+        )
+
+
+    def forward(self, xq, xk, xv, start_pos, inference, causal_mask=None, flash_attn=True):
+        B, T, C= xq.size()  # x(batch_size, sequence length, d_model)
+        assert C == self.d_model, "Input embedding dimension must match model embedding dimension"
+
+        # calculate query, key, values for all heads
+        q= self.q_proj(xq)  # q -> (B, T, C)
+        k= self.k_proj(xk)  # k -> (B, T, C // n_rep)
+        v= self.v_proj(xv)  # v -> (B, T, C // n_rep)
+
+        if self.headwise_attn_gate:
+            q= q.view(B, T, self.n_kv_heads, -1)
+            q, attn_gate= torch.split(q, [self.d_head * self.n_rep, self.n_rep], dim=-1)
+            attn_gate= attn_gate.reshape(B, T, -1, 1)
+            q= q.reshape(B, T, -1, self.d_head)
+        else:
+            q= q.view(B, -1, self.n_heads * self.diff_factor, self.d_head)  # q view -> (B, T, nh,   dh)
+
+        # reshape for Group Query Multi-Headed Attention (double n_heads for q and k when diff_attn)
+        k= k.view(B, -1, self.n_kv_heads * self.diff_factor,  self.d_head)  # k view -> (B, T, nkvh, dh)
+        v= v.view(B, -1, self.n_kv_heads,  self.diff_factor * self.d_head)  # v view -> (B, T, nkvh, dh)
+        # apply RoPE to query and key embeddings
+        q, k= self.ropenc(q, k, start_pos, inference)
+        if self.use_qk_norm:
+            q, k= self.norm(q), self.norm(k)  # QK norm
+        # here, key and value shapes are not the same with query, which has to be to compute
+        # Attention scores
+        k= self.repeat_kv(k, self.n_rep)  # k -> (B, T, nh, dh)
+        v= self.repeat_kv(v, self.n_rep)  # v -> (B, T, nh, dh)
+        # to compute Attention, we need to bring heads at dim 1 and T at dim 2
+        q= q.transpose(1, 2).contiguous()
+        k= k.transpose(1, 2).contiguous()  # q,k,v transp -> (B, nh, T, dh)
+        v= v.transpose(1, 2).contiguous()
+
+        if flash_attn and (not inference):
+            # applies FlashAttention
+            is_causal= False if causal_mask is None else True
+
+            if self.diff_attn is None:
+                y= F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=self.dropout.p, is_causal=is_causal
+                )
+            else:
+                y= self.diff_attn(q, k, v, is_causal, flash_attn)
+        else:
+            # implements Attention
+            if self.diff_attn is None:
+                # the original 'scaled dot product'
+                attn= (q @ k.transpose(-2, -1)) * self.scaling  # attn -> (B, nh, T, T)
+                # apply causal mask (when the mask is not None)
+                if causal_mask is not None:
+                    attn= attn.masked_fill(causal_mask[:,:,:T,:T]== 0, float('-inf'))
+                # normalize Attention scores
+                attn= F.softmax(attn, dim=-1, dtype=torch.float32).type_as(attn)
+                attn= self.dropout(attn)
+                # compute Attention output
+                y= attn @ v  # (B, nh, T, dh)
+            else:
+                y= self.diff_attn(q, k, v, causal_mask, flash_attn)
+
+        # concatenate multi-head outputs -- re-assembly all head outputs side by side
+        y= y.transpose(1, 2).contiguous()
+
+        if self.headwise_attn_gate:
+            y= y * torch.sigmoid(attn_gate)
+
+        y= y.reshape(B, -1, C)  # (B, T, nh, dh) -> (B, T, C)
+        # output projection
+        return self.o_proj(y)
+
+
+
+"""
+Transformer Block
+"""
+
+
+class TransformerBlock(nn.Module):
+    """
+    The Transformer Block (Encoder/Decoder-only, pre-normalization version).
+    - If multi_modal=True, we have an extra cross-attention module to incorporate exogenous
+    covariates and allow for multi-modal learning.
+    - If is_causal=True, we have a Decoder Transformer; otherwise, an Encoder Transformer.
+    - norm_type (str): 'layer' for LayerNorm, 'rms' for RMSNorm, or 'dyt' for DynamicTanh.
+    - If diff_attn=True, we use Differential Attention.
+    - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
+    'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that
+    can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    Note that FlashAttention can be enabled on the fly in the MultiHeadedAttention module
+    through the setting of flash_attn in the forward method.
+    """
+
+    def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6,
+                 d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
+                 ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False) -> None:
+        super(TransformerBlock, self).__init__()
+
+        # Self-Attention module to endogenous series
+        self.norm1= self.get_norm(norm_type, d_model, init_alpha=0.6)
+        self.s_att= MultiHeadedAttention(
+            depth, d_model, block_size, n_heads, n_kv_heads, dropout, diff_attn, bias, rope_theta,
+            use_qk_norm, headwise_attn_gate
+        )
+        self.drop_path1= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        # Cross-Attention module to incorporate exogenous covariates
+        if multi_modal:
+            self.norm2= self.get_norm(norm_type, d_model, init_alpha=0.6)
+            self.c_att= MultiHeadedAttention(
+                depth, d_model, block_size, n_heads, n_kv_heads, dropout, False, bias, rope_theta,
+                use_qk_norm, headwise_attn_gate
+            )
+            self.drop_path2= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        else:
+            self.c_att= None
+
+        # Mixture-of-Experts (MoE) module allows heterogeneous experts (MoHE)
+        self.norm3= self.get_norm(norm_type, d_model, init_alpha=0.2)
+        self.ffn  = MoEFeedForward(
+            d_model, d_ff, dropout, ffn_type, False, glu, n_experts, top_k_experts, experts_type,
+            bias
+        )
+        self.drop_path3= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+
+    def get_norm(self, norm_type, d_model, init_alpha=0.5):
+        if norm_type == 'rms':
+            return RMSNorm(d_model)
+        elif norm_type == 'dyt':
+            return DynamicTanh(d_model, init_alpha)
+        else:
+            return nn.LayerNorm(d_model)
+
+
+    def forward(self, x, x_cross, start_pos, inference, causal_mask=None, flash_attn=True):
+        x_norm= self.norm1(x)
+        x= x + self.drop_path1(self.s_att(
+            x_norm, x_norm, x_norm, start_pos, inference, causal_mask, flash_attn
+        ))
+        if (self.c_att is not None) and (x_cross is not None):
+            x_norm= self.norm2(x)
+            x= x + self.drop_path2(self.c_att(  # no causal_mask in cross-attention
+                x_norm, x_cross, x_cross, start_pos, inference, None, flash_attn
+            ))
+        x_norm= self.norm3(x)
+        x= x + self.drop_path3(self.ffn(x_norm))
+
+        return x, self.ffn.router_logits
+
+
+
+"""
+Transformer Model
+"""
+
+
+class TransformerModel(nn.Module):
+    """
+    A Transformer model is essentially a stack of N Encoder/Decoder Blocks.
+    - If multi_modal=True, we have an extra cross-attention module to incorporate exogenous
+    covariates and allow for multi-modal learning.
+    - If is_causal=True, we have a Decoder Transformer; otherwise, an Encoder Transformer.
+    - norm_type (str): 'layer' for LayerNorm, 'rms' for RMSNorm, or 'dyt' for DynamicTanh.
+    - If diff_attn=True, we use differential attention.
+    - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
+    'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that
+    can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    """
+
+    def __init__(
+        self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
+        n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
+        diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2,
+        experts_type='fan', bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False
+    ) -> None:
+        super(TransformerModel, self).__init__()
+        # block_size represents the max sequence length
+        self.block_size= block_size
+        # create a lower triangular matrix (2D tensor)
+        self.register_buffer(
+            'causal_mask_buffer',
+            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
+            persistent=False
+        )
+        # set the causal mask and FlashAttention use
+        self.flash_attn = flash_attn
+        self.causal_mask= None
+        self.def_causal_mask(is_causal, self.flash_attn)
+        # stochastic decay according to each TransformerBlock depth
+        sdp_rates= [x.item() for x in torch.linspace(0, drop_path, n_layer)]
+
+        # define a stack of TransformerBlocks
+        self.transformer= nn.ModuleList([
+            TransformerBlock(
+                multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout,
+                sdp_rates[depth], norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts,
+                experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate
+            ) for depth in range(n_layer)
+        ])
+        # final normalization layer after the last TransformerBlock
+        self.final_norm= self.transformer[-1].get_norm(norm_type, d_model, init_alpha=0.2)
+
+
+    def def_causal_mask(self, is_causal, flash_attn=True):
+        """
+        If is_causal=True, we have a Decoder Transformer; otherwise, an Encoder Transformer.
+        """
+        self.flash_attn= flash_attn
+
+        if is_causal and (not self.flash_attn):
+            # causal mask tensor on the Attention outputs when TransformerModel is a Decoder, i.e.,
+            # current steps depend on the past only
+            self.causal_mask= self.causal_mask_buffer
+        elif is_causal and self.flash_attn:
+            # causal mask when TransformerModel is a Decoder using FlashAttention
+            self.causal_mask= True
+        else:
+            # no causal mask when TransformerModel is an Encoder
+            self.causal_mask= None
+
+
+    def forward(self, x, x_cross, start_pos, inference):
+        B, T, C= x.size()  # x(batch_size, sequence length, d_model)
+        assert T <= self.block_size, \
+            f"Cannot forward sequence of length {T}, block size is only {self.block_size}"
+
+        if self.causal_mask is not None:
+            if inference:
+                self.def_causal_mask(is_causal=True, flash_attn=False)
+            else:
+                self.def_causal_mask(is_causal=True, flash_attn=self.flash_attn)
+
+        if isinstance(self.causal_mask, torch.Tensor):
+            if self.causal_mask.device != x.device:
+                self.causal_mask= self.causal_mask.to(x.device)
+
+        all_router_logits= ()
+        # forward the embedding through the transformer
+        for block in self.transformer:
+            x, router_logits= block(
+                x, x_cross, start_pos, inference, self.causal_mask, self.flash_attn
+            )
+            all_router_logits += (router_logits,)
+
+        return self.final_norm(x), all_router_logits
