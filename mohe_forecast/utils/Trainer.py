@@ -10,6 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import logging
 from dataclasses import asdict
 from ..model.TSFT import TSFTransformer
 from tqdm import tqdm
@@ -24,13 +25,12 @@ class Trainer:
     - scheduler (optional): a per-step learning rate scheduler (not per epoch).
     - early_stopping (optional): early stopping utility.
     - use_time_features (optional): whether to use time covariates.
-    - TODO: switch raw prints by loggings.
     """
 
     def __init__(self, model, device, train_loader, train_ds_scaler, val_loader, test_loader,
                  criterion, optimizer, scheduler=None, aux_criterion=None, early_stopping=None,
                  use_time_features=False, do_validation=True, augmentation=None, checkpointing=True,
-                 checkpoint_dir=None, filename=None, verbose=True) -> None:
+                 checkpoint_dir=None, filename=None, verbose=False) -> None:
         self.model= model
         self.device= torch.device(device)
         self.train_loader= train_loader
@@ -54,6 +54,37 @@ class Trainer:
         self.lr_hist= []
         # train_ds_scaler for denormalization
         self.train_ds_scaler= train_ds_scaler
+        # --- minimal logging ---
+        self._log= self._build_logger(f"{self.__class__.__name__}")
+
+
+    def _build_logger(self, name):
+        """
+        Build a logger for the Trainer class.
+        """
+        filename= f'{self.filename}.log'
+        checkpoint_dir= self.checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        log_path= os.path.abspath(os.path.join(checkpoint_dir, filename))
+
+        logger= logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        logger.propagate= False
+
+        fmt= logging.Formatter(
+            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        # file handler
+        for h in logger.handlers:
+            if isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, "baseFilename", "")) == log_path:
+                return logger
+        fh= logging.FileHandler(log_path, mode="a")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+        return logger
 
 
     def train_one_epoch(self, epoch):
@@ -96,6 +127,9 @@ class Trainer:
 
             # check loss finite
             if not torch.isfinite(loss).all():
+                self._log.warning(
+                    "train_one_epoch | non_finite_loss | epoch=%d | loss=%s", epoch, str(loss.detach().cpu())
+                )
                 # best to raise early to see where it happened
                 raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
 
@@ -170,6 +204,9 @@ class Trainer:
 
             # check loss finite
             if not torch.isfinite(loss).all():
+                self._log.warning(
+                    "train_one_epoch_bf16 | non_finite_loss | epoch=%d | loss=%s", epoch, str(loss.detach().cpu())
+                )
                 # best to raise early to see where it happened
                 raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
 
@@ -266,13 +303,21 @@ class Trainer:
             end= time.time()
             dt = end - start
 
-            if self.verbose:
-                if val_loss is not None:
+            if val_loss is not None:
+                self._log.info(
+                    "train | epoch=%d/%d | train_loss=%.6f | val_loss=%.6f | lr=%.3e | dt=%.2fs",
+                    epoch + 1, epochs, train_loss, val_loss, epoch_lr, dt
+                )
+                if self.verbose:
                     print(f'Train loss: {train_loss:.4f}')
                     print(f'Valid loss: {val_loss:.4f} | dt/epoch: {dt*1000:.2f}ms')
-                else:  # val_loss is None
+            else:  # val_loss is None
+                self._log.info(
+                    "train | epoch=%d/%d | train_loss=%.6f | val_loss not computed | lr=%.3e | dt=%.2fs",
+                    epoch + 1, epochs, train_loss, epoch_lr, dt
+                )
+                if self.verbose:
                     print(f'Train loss: {train_loss:.4f} | dt/epoch: {dt*1000:.2f}ms')
-                print(f'======= Epoch {epoch+1} Completed =======')
 
             if val_loss is not None:
                 if val_loss < best_val_loss:
@@ -286,13 +331,19 @@ class Trainer:
                     # Watches validation MSE and halts training if it hasn't improved
                     avg_val_loss= np.mean(self.val_losses)
                     if self.early_stopping(avg_val_loss, epoch+1):
+                        self._log.warning(
+                            "train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f",
+                            epoch + 1, avg_val_loss
+                        )
                         break
 
         if val_loss is not None:
-            print(f'Best Validation Loss: {best_val_loss:.4f} (Epoch {best_epoch + 1})')
+            self._log.info("train | Best Validation Loss: %.6f | Epoch: %d", best_val_loss, best_epoch + 1)
+            if self.verbose:
+                print(f'Best Validation Loss: {best_val_loss:.4f} (Epoch {best_epoch + 1})')
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
-                self.save_checkpoint(epochs, best_val_loss)
+                self.save_checkpoint(best_epoch, best_val_loss)
 
 
     def test(self, test_loader=None, inverse_transform=False, test_criterion=nn.MSELoss(reduction='none')):
@@ -377,10 +428,17 @@ class Trainer:
         }
         try:
             torch.save(checkpoint, checkpoint_path)
+            self._log.info(
+                "save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s",
+                epoch + 1, best_val_loss, checkpoint_path
+            )
             if self.verbose:
                 print(f"[INFO] Checkpoint saved at '{checkpoint_path}'")
         except Exception as e:
-            print(f"[ERROR] Failed to save checkpoint: {e}")
+            self._log.warning("save_checkpoint | Failed to save checkpoint: %s", e)
+            if self.verbose:
+                print(f"[ERROR] Failed to save checkpoint: {e}")
+            raise e
 
 
     @staticmethod
@@ -407,18 +465,22 @@ class Trainer:
 
         try:
             checkpoint= torch.load(checkpoint_path, map_location=self.device)
-            # Restore model state
+            # restore model state
             self.model.load_state_dict(self.strip_module_prefix(checkpoint['model_state_dict']))
             # ensure model on target device
             if getattr(self, 'model', None) is not None:
                 self.model.to(self.device)
-            # Restore optimizer state
+            # restore optimizer state
             if restore_optimizer:
                 if getattr(self, "optimizer", None) is None:
-                    print("[INFO] Checkpoint contains optimizer state, but self.optimizer is None: skipping optimizer restore.")
+                    self._log.warning(
+                        "load_checkpoint | Checkpoint contains optimizer state, but self.optimizer is None: skipping optimizer restore."
+                    )
+                    if self.verbose:
+                        print("[WARNING] Checkpoint contains optimizer state, but self.optimizer is None: skipping optimizer restore.")
                 else:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            # Retrieve training metadata
+            # retrieve training metadata
             epoch= checkpoint['epoch']
             best_val_loss= checkpoint.get('best_val_loss', float('inf'))
             if restore_metadata:
@@ -426,11 +488,20 @@ class Trainer:
                 self.val_losses= checkpoint.get('val_losses', [])
                 self.lr_hist= checkpoint.get('lr_hist', [])
 
-            print(f"[INFO] Checkpoint loaded from '{checkpoint_path}'. Resuming training with best validation loss of {best_val_loss:.4f}.")
+            self._log.info(
+                "load_checkpoint | Checkpoint loaded from '%s'. Resuming training with best validation loss of %.4f.",
+                checkpoint_path, best_val_loss
+            )
+            if self.verbose:
+                print(f"[INFO] Checkpoint loaded from '{checkpoint_path}'. Resuming training with best validation loss of {best_val_loss:.4f}.")
             return epoch, best_val_loss
 
         except Exception as e:
-            print(f"[ERROR] Failed to load checkpoint from {checkpoint_path}: {e}")
+            self._log.warning(
+                "load_checkpoint | Failed to load checkpoint from %s: %s", checkpoint_path, e
+            )
+            if self.verbose:
+                print(f"[ERROR] Failed to load checkpoint from {checkpoint_path}: {e}")
             raise e
 
 
@@ -451,14 +522,20 @@ class Trainer:
             if not isinstance(config_args, dict):
                 raise TypeError("checkpoint['config'] should be a dict of constructor kwargs")
 
-            print(f'[INFO] Building a model with config: {config_args}')
+            self._log.info("build_model | Building a new model with config: %s", config_args)
+            if self.verbose:
+                print(f'[INFO] Building a new model with config: {config_args}')
             self.model= TSFTransformer(**config_args).to(self.device)
             # restore model state
             epoch, best_val_loss= self.load_checkpoint(checkpoint_path, restore_optimizer, restore_metadata)
             return self.model, epoch, best_val_loss
 
         except Exception as e:
-            print(f"[ERROR] Failed to build and load checkpoint from {checkpoint_path}: {e}")
+            self._log.warning(
+                "build_model | Failed to build and load checkpoint from %s: %s", checkpoint_path, e
+            )
+            if self.verbose:
+                print(f"[ERROR] Failed to build and load checkpoint from {checkpoint_path}: {e}")
             raise e
 
 

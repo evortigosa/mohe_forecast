@@ -5,6 +5,7 @@ Early Stopping
 """
 
 import math
+import logging
 
 
 
@@ -13,7 +14,7 @@ class EarlyStopping:
     Early stopping utility to terminate training when the loss does not improve sufficiently.
     """
 
-    def __init__(self, patience=7, min_delta=1e-6, mode="min", verbose=True):
+    def __init__(self, patience=7, min_delta=1e-6, mode="min", verbose=False):
         assert patience >= 0, "patience must be non-negative"
         assert min_delta >= 0, "min_delta must be non-negative"
         assert mode in ("min", "max"), "mode must be 'min' or 'max'"
@@ -24,6 +25,8 @@ class EarlyStopping:
         self.counter= 0
         self.best_loss= math.inf if mode == "min" else -math.inf
         self.early_stop= False
+        # --- minimal logging ---
+        self._log= logging.getLogger(self.__class__.__name__)
 
 
     def extra_repr(self):
@@ -52,6 +55,9 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop= True
+                self._log.warning(
+                    "early_stopping_triggered | non_finite_metric | epoch=%d", epoch
+                )
                 if self.verbose:
                     print(f"[EarlyStopping] Stopping: non-finite metric at epoch {epoch}.")
 
@@ -67,6 +73,9 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop= True
+                self._log.warning(
+                    "early_stopping_triggered | no_improvement | epoch=%d", epoch
+                )
                 if self.verbose:
                     print(f"[EarlyStopping] Early stopping triggered at epoch {epoch}.")
 
