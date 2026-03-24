@@ -451,12 +451,25 @@ class Trainer:
         return state_dict
 
 
-    def load_checkpoint(self, checkpoint_path, restore_optimizer=False, restore_metadata=False) -> tuple:
+    def load_checkpoint(self, filename=None, checkpoint_dir=None, restore_optimizer=False,
+                        restore_metadata=False) -> tuple:
         """
         This method loads the checkpoint from the given path and restores the model, optimizer
         (optional, when restore_optimizer=True), and training history.
         - TODO: Fix dtype, device, and layout for optimizer state.
         """
+        if (filename is not None) and (checkpoint_dir is None):
+            # assume that filename holds the complete checkpoint_path
+            checkpoint_path= os.path.join(filename)
+        elif (filename is None) and (checkpoint_dir is not None):
+            # filename takes the default value
+            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
+        else:
+            if (filename is None) and (checkpoint_dir is None):
+                checkpoint_dir= self.checkpoint_dir
+                filename= f'{self.filename}.pth'
+            checkpoint_path= os.path.join(checkpoint_dir, filename)
+
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
         # ensure model exists before loading (build_model will create it)
@@ -505,10 +518,23 @@ class Trainer:
             raise e
 
 
-    def build_model(self, checkpoint_path, restore_optimizer=False, restore_metadata=False) -> tuple:
+    def build_model(self, filename=None, checkpoint_dir=None, restore_optimizer=False,
+                    restore_metadata=False) -> tuple:
         """
         Build a model from a given checkpoint.
         """
+        if (filename is not None) and (checkpoint_dir is None):
+            # assume that filename holds the complete checkpoint_path
+            checkpoint_path= os.path.join(filename)
+        elif (filename is None) and (checkpoint_dir is not None):
+            # filename takes the default value
+            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
+        else:
+            if (filename is None) and (checkpoint_dir is None):
+                checkpoint_dir= self.checkpoint_dir
+                filename= f'{self.filename}.pth'
+            checkpoint_path= os.path.join(checkpoint_dir, filename)
+
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
@@ -527,7 +553,9 @@ class Trainer:
                 print(f'[INFO] Building a new model with config: {config_args}')
             self.model= TSFTransformer(**config_args).to(self.device)
             # restore model state
-            epoch, best_val_loss= self.load_checkpoint(checkpoint_path, restore_optimizer, restore_metadata)
+            epoch, best_val_loss= self.load_checkpoint(
+                filename, checkpoint_dir, restore_optimizer, restore_metadata
+            )
             return self.model, epoch, best_val_loss
 
         except Exception as e:
