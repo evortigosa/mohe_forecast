@@ -567,11 +567,16 @@ class Trainer:
             raise e
 
 
-    def plot_results(self, cut_first_epoch=True, save_charts=False, file_name='training_results') -> None:
+    def plot_results(self, cut_first_epoch=False, show_plot=False, save_charts=False, as_pdf=False,
+                     file_name='training_results') -> None:
         """
         Plot training metrics including training loss, validation loss, and learning rate history
-        over epochs. The results can be saved as file_name.pdf.
+        over epochs. The results can be saved as checkpoint_dir/file_name.pdf.
         """
+        checkpoint_dir= self.checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        save_path= os.path.join(checkpoint_dir, file_name)
+
         epochs= range(1, len(self.train_losses) + 1)
         if cut_first_epoch:
             epochs= epochs[1:]
@@ -602,7 +607,16 @@ class Trainer:
         plt.grid(True, linestyle='--', alpha=0.7)
 
         plt.tight_layout()
+        if save_charts and as_pdf:
+            plt.savefig(f'{save_path}.pdf', dpi=300, pad_inches=0.01, bbox_inches="tight")
+        elif save_charts:
+            plt.savefig(f'{save_path}.svg', pad_inches=0.01, bbox_inches="tight")
         if save_charts:
-            plt.savefig(f'{file_name}.pdf', pad_inches=0.01, bbox_inches="tight")
-        plt.show()
+            self._log.warning(
+                "plot_results | Training charts were saved at: %s", save_path
+            )
+            if self.verbose:
+                print(f"[INFO] Training charts were saved at: {save_path}")
+        if show_plot:
+            plt.show()
         plt.close()
