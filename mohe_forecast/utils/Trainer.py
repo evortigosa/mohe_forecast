@@ -567,7 +567,7 @@ class Trainer:
             raise e
 
 
-    def plot_results(self, cut_first_epoch=False, show_plot=False, save_charts=False, as_pdf=False,
+    def plot_results(self, cut_first_epoch=False, show_plot=True, save_charts=False, as_pdf=False,
                      file_name='training_results') -> None:
         """
         Plot training metrics including training loss, validation loss, and learning rate history
