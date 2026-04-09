@@ -94,6 +94,11 @@ class Dataset_ETT(Dataset):
     """
     PyTorch Dataset for either the original ETT CSVs or in-memory DataFrames from NeuralForecast,
     producing sliding windows with optional time‐feature encoding.
+    - root_path (str): Path of the local CSV file
+    - data_path (str): Name of the benchmark data (e.g., ETTh1, ETTm2, etc.)
+    - from_csv (bool): False, read data from NeuralForecast. True, provide a local CSV file
+    - use_time_features (bool): Default is False. Enable or disable time stamp covariates
+    - freq (str): 'h' or 'min' sampling frequency of the datapoints
     The original ETT‐style loader returns:
     - inputs: history data for training (seq_len)
     - targets: history tail (label_len) U forecast horizon (pred_len)
@@ -231,7 +236,11 @@ class Dataset_Custom(Dataset):
     """
     PyTorch Dataset for either CSVs or in-memory DataFrames from NeuralForecast, producing
     sliding windows with optional time‐feature encoding.
-    - freq: 'h' or 'min'
+    - root_path (str): Path of the local CSV file
+    - data_path (str): Name of the benchmark data (e.g., Weather, ECL, etc.)
+    - from_csv (bool): False, read data from NeuralForecast. True, provide a local CSV file
+    - use_time_features (bool): Default is False. Enable or disable time stamp covariates
+    - freq (str): 'h' or 'min' sampling frequency of the datapoints
     Returns:
     - inputs: history data for training (seq_len)
     - targets: history tail (label_len) U forecast horizon (pred_len)
@@ -369,7 +378,10 @@ class Dataset_GlobalTemp(Dataset):
     """
     PyTorch Dataset for npy files of the Global Temp Dataset, producing sliding windows with
     time‐feature encoding.
-    - freq: 'h' or 'min'
+    - root_path (str): Path of the local CSV file
+    - data_path (str): Name of the benchmark data
+    - use_time_features (bool): Default is False. Enable or disable time stamp covariates
+    - freq (str): 'h' or 'min' sampling frequency of the datapoints
     Returns:
     - inputs: history data for training (seq_len)
     - targets: history tail (label_len) U forecast horizon (pred_len)

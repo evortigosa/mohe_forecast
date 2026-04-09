@@ -4,7 +4,6 @@ Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts
 Get DataLoader objects for ETT and other datasets.
 """
 
-import numpy as np
 from torch.utils.data import DataLoader
 from .DataLoaders import Dataset_ETT, Dataset_Custom, Dataset_GlobalTemp
 
@@ -37,8 +36,8 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, from_csv
         raise ValueError("patch_width and block_size must be positive.")
     if patch_width > block_size:
         raise ValueError(f"patch_width ({patch_width}) cannot exceed block_size ({block_size}).")
-    if out_width <= 0.0:
-        raise ValueError("out_width must be a positive number.")
+    if out_width < 0.0:
+        raise ValueError("out_width must be a non-negative number.")
     if int(patch_width * out_width) > block_size:
         raise ValueError("patch_width * out_width cannot exceed block_size (would make label_len negative).")
 
@@ -212,8 +211,8 @@ def get_custom_data_loaders(root_path, dataset_name, from_csv, btc_size, time_co
         raise ValueError("patch_width and block_size must be positive.")
     if patch_width > block_size:
         raise ValueError(f"patch_width ({patch_width}) cannot exceed block_size ({block_size}).")
-    if out_width <= 0.0:
-        raise ValueError("out_width must be a positive number.")
+    if out_width < 0.0:
+        raise ValueError("out_width must be a non-negative number.")
     if int(patch_width * out_width) > block_size:
         raise ValueError("patch_width * out_width cannot exceed block_size (would make label_len negative).")
 
@@ -334,8 +333,8 @@ def get_global_temp_data_loaders(root_path='./global_temp', data_path='temp_glob
         raise ValueError("patch_width and block_size must be positive.")
     if patch_width > block_size:
         raise ValueError(f"patch_width ({patch_width}) cannot exceed block_size ({block_size}).")
-    if out_width <= 0.0:
-        raise ValueError("out_width must be a positive number.")
+    if out_width < 0.0:
+        raise ValueError("out_width must be a non-negative number.")
     if int(patch_width * out_width) > block_size:
         raise ValueError("patch_width * out_width cannot exceed block_size (would make label_len negative).")
 
