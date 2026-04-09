@@ -83,7 +83,7 @@ def build_parser():
     parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable text infos")
     # model
-    parser.add_argument("--model-size",  type=str, default='base', help="Type of model configuration")
+    parser.add_argument("--model-size",  type=parse_value, default='base', help="Type of model configuration")
     parser.add_argument("--block-size",  type=int, default=672, help="Input sequence length / context window")
     parser.add_argument("--patch-width", type=int, default=8, help="Patch width")
     parser.add_argument("--width-factor",type=float, default=3, help="Output patch width")
@@ -125,6 +125,17 @@ def build_parser():
 def count_parameters(model) -> None:
     total_params= sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Number of model parameters: {total_params}')
+
+
+def setup_model_from_checkpoint(filename, checkpoint_dir, device, verbose=True):
+    trainer= Trainer(
+        model=None, device=device, train_loader=None, train_ds_scaler=None, val_loader=None, test_loader=None, 
+        criterion=None, optimizer=None, checkpoint_dir=checkpoint_dir, filename=filename, verbose=verbose
+    )
+    model, _, _= trainer.build_model(filename=None, checkpoint_dir=checkpoint_dir)
+    del trainer
+
+    return model, model.config
 
 
 def setup_model(model_size, device, args):
@@ -246,8 +257,14 @@ def main(device, use_fused, use_flashattn):
         print(f"[INFO] Device: {device}; Using fused AdamW: {use_fused}; FlashAttention available: {use_flashattn}")
 
     model_size= args.model_size
+    check_dir = args.checkpoint_dir
+    check_file= args.checkpoint_file
+    plot_file = args.plot_file
 
-    ts_model, model_config= setup_model(model_size, device, args)
+    if model_size is None:  # when None, try to build a model from the checkpoint
+        ts_model, model_config= setup_model_from_checkpoint(check_file, check_dir, device, verbose)
+    else:
+        ts_model, model_config= setup_model(model_size, device, args)
     if verbose:
         count_parameters(ts_model)
 
@@ -269,9 +286,6 @@ def main(device, use_fused, use_flashattn):
               f"{len(enc_val_loader)}, {len(test_loader_96)}")
 
     epochs= args.epochs
-    check_dir= args.checkpoint_dir
-    check_file=args.checkpoint_file
-    plot_file =args.plot_file
     max_lr= args.max_lr
     min_lr= args.min_lr
     warmup_portion= args.warmup_portion
