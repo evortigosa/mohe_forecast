@@ -518,7 +518,7 @@ class Trainer:
             raise e
 
 
-    def build_model(self, filename=None, checkpoint_dir=None, restore_optimizer=False,
+    def build_model(self, filename=None, checkpoint_dir=None, restore_model=False, restore_optimizer=False,
                     restore_metadata=False) -> tuple:
         """
         Build a model from a given checkpoint.
@@ -552,10 +552,14 @@ class Trainer:
             if self.verbose:
                 print(f'[INFO] Building a new model with config: {config_args}')
             self.model= TSFTransformer(**config_args).to(self.device)
-            # restore model state
-            epoch, best_val_loss= self.load_checkpoint(
-                filename, checkpoint_dir, restore_optimizer, restore_metadata
-            )
+
+            epoch= 0
+            best_val_loss= 0.0
+            if restore_model:  # restore model state
+                epoch, best_val_loss= self.load_checkpoint(
+                    filename, checkpoint_dir, restore_optimizer, restore_metadata
+                )
+
             return self.model, epoch, best_val_loss
 
         except Exception as e:
