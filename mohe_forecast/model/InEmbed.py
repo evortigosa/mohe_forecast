@@ -475,6 +475,10 @@ class EmbeddingDecoderMAE(nn.Module):
         torch.nn.init.normal_(self.mask_token, std=.02)
 
 
+    def extra_repr(self):
+        return f"cls_token={self.has_cls_tk}"
+
+
     def forward(self, x, ids_restore, cls_token=None):
         if cls_token is not None:
             self.has_cls_tk= True

@@ -113,3 +113,12 @@ class LargeConfig(BaseConfig):
     n_heads:int= 12
     n_kv_heads:int= 6
     d_ff:int= 768
+
+
+@dataclass
+class UltraConfig(BaseConfig):
+    n_layer:int= 12
+    d_model:int= 512
+    n_heads:int= 16
+    n_kv_heads:int= 8
+    d_ff:int= 1024

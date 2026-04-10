@@ -98,11 +98,11 @@ class TSFTransformer(nn.Module):
             self.t_embedding= PatchEmbeddingV3(self.patch_width, channels, d_model, dropout)
         else:
             self.t_embedding= PatchEmbedding(self.patch_width, channels, d_model, dropout)
-        # define the patch embedding for exogenous calendar covariates
+        # define the patch embedding for exogenous covariates
         if multi_modal is None:
             self.c_embedding= nn.Identity()  # enable custom, external covariate embeddings
         elif multi_modal:
-            emb_norm_type= 'rms' if emb_norm_type is None else emb_norm_type
+            emb_norm_type= 'layer' if emb_norm_type is None else emb_norm_type
             self.c_embedding= MultiModalEmbedding(self.patch_width, channels, d_model, dropout, emb_norm_type)
         else:
             self.c_embedding= None
