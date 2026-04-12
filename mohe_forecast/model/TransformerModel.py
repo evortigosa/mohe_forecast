@@ -308,16 +308,16 @@ KV Cache
 
 class KVCache:
     """
+    Implements a Key-Value Cache module for Decoder-only Transformers.
     --- THIS IS A WIP ---
-    Implements a Key-Value Cache module for sliding-window time-series forecasting.
-    Based on in-place left-shifts, avoiding repeated concatenations or allocations.
+    TODO: Adapt to Encoder-only models and sliding-window forecasting.
     """
 
     def __init__(self, block_size, n_kv_heads, d_head) -> None:
         self.block_size= block_size
-        self.n_kv_heads= n_kv_heads
-        self.d_head= d_head
-        self.is_empty= True
+        self.n_heads= n_kv_heads
+        self.d_head = d_head
+        self.cache_len= 0
         # None until init_cache is called
         self.k_cache= None
         self.v_cache= None
@@ -328,10 +328,10 @@ class KVCache:
 
     def is_none(self) -> bool:
         """
-        Check if caches are unallocated and update is_empty flag.
+        Check if caches are unallocated and update cache_len.
         """
         if self.k_cache is None or self.v_cache is None:
-            self.is_empty= True
+            self.cache_len= 0
             return True
         return False
 
@@ -342,7 +342,7 @@ class KVCache:
         """
         if self.batch_size is None or self.device is None or self.dtype is None:
             return False
-        if (batch_size != self.batch_size) or (n_heads != self.n_kv_heads) or (d_head != self.d_head):
+        if (batch_size != self.batch_size) or (n_heads != self.n_heads) or (d_head != self.d_head):
             return False
         if (device != self.device) or (dtype != self.dtype):
             return False
@@ -351,12 +351,12 @@ class KVCache:
 
     def cache_invalidation(self) -> None:
         """
-        Logically free the caches.
+        Logically free the cache.
         """
         if not self.is_none():
             self.k_cache.zero_()
             self.v_cache.zero_()
-        self.is_empty= True
+        self.cache_len= 0
 
 
     def alloc_buffers(self, batch_size, device, dtype) -> None:
@@ -366,79 +366,70 @@ class KVCache:
         self.batch_size= batch_size
         self.device= device
         self.dtype = dtype
-        shape= (self.batch_size, self.block_size, self.n_kv_heads, self.d_head)
+        shape= (self.batch_size, self.n_heads, self.block_size, self.d_head)
         # use zeros for deterministic memory
         self.k_cache= torch.zeros(shape, device=self.device, dtype=self.dtype)
         self.v_cache= torch.zeros(shape, device=self.device, dtype=self.dtype)
-        self.is_empty= True
+        self.cache_len= 0
 
 
     def init_cache(self, k, v) -> None:
         """
-        Initialize cache from a full context window.
+        Initialize the cache.
         """
-        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, T, n_heads, d_head)"
-        B, T, nh, dh= k.shape
-        assert T  == self.block_size, f"k length {T} must equal block_size {self.block_size}"
-        assert nh == self.n_kv_heads, f"n_kv_heads mismatch: {nh} vs {self.n_kv_heads}"
+        B, nh, T, dh= k.shape
 
         if not self.cache_validation(B, nh, dh, k.device, k.dtype):
             # allocate new buffers when needed or metadata mismatch
             self.alloc_buffers(B, k.device, k.dtype)
-        self.is_empty= False
-        # copy (detach incoming to avoid keeping graph)
-        self.k_cache.copy_(k.detach())
-        self.v_cache.copy_(v.detach())
+        else:
+            self.cache_invalidation()
 
 
     def get_kv(self):
         """
         Return current caches (raises if empty).
         """
-        if self.is_empty or self.is_none():
+        if self.cache_len == 0 or self.is_none():
             raise RuntimeError("KV Cache is empty.")
         return self.k_cache, self.v_cache
 
 
     def update(self, k, v):
         """
-        Append T new KV vectors and drop the oldest T new (sliding window update).
+        Append T new KV vectors.
         """
-        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, T, n_heads, d_head)"
-        B, T_new, nh, dh= k.shape
+        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, n_heads, T, d_head)"
+        B, nh, T_new, dh= k.shape
+        assert nh == self.n_heads, f"n_kv_heads mismatch: {nh} vs {self.n_heads}"
+        assert dh == self.d_head,  f"d_head mismatch: {dh} vs {self.d_head}"
 
         if T_new > self.block_size:
             raise ValueError(f"Sequence ({T_new}) cannot exceed block_size ({self.block_size})")
 
-        # nothing to do -> return current cache (or raise if empty)
+        # nothing to do -> return current cache
         if T_new == 0:
-            if self.is_empty or self.is_none():
-                raise RuntimeError("KV Cache is empty and no tokens provided.")
-            return self.k_cache, self.v_cache
+            return self.get_kv()
 
-        # cache is empty -> initialize from a full context window.
-        if self.is_empty or self.is_none():
+        # cache is empty -> initialize it to store a full context window.
+        if self.cache_len == 0 or self.is_none():
             self.init_cache(k, v)
-            return self.k_cache, self.v_cache
 
         # cache is not empty -> verify shapes / device
         if not self.cache_validation(B, nh, dh, k.device, k.dtype):
             raise RuntimeError("k shape/device/dtype must match existing cache metadata")
 
-        # shift left by T_new -> [:, :block_size - T_new, :, :]= [:, T_new:, :, :]
-        if T_new < self.block_size:
-            T_keep= self.block_size - T_new
-            self.k_cache[:, :T_keep, :, :].copy_(self.k_cache[:, T_new:, :, :].clone())
-            self.v_cache[:, :T_keep, :, :].copy_(self.v_cache[:, T_new:, :, :].clone())
-            # write new tokens at end
-            self.k_cache[:, T_keep:, :, :].copy_(k.detach())
-            self.v_cache[:, T_keep:, :, :].copy_(v.detach())
-        else:
-            # T_new == block_size -> full replace
-            self.k_cache.copy_(k.detach())
-            self.v_cache.copy_(v.detach())
+        # store key and value token embeddings into their respective caches
+        self.k_cache[:B, :, self.cache_len:self.cache_len + T_new, :].copy_(k)
+        self.v_cache[:B, :, self.cache_len:self.cache_len + T_new, :].copy_(v)
+        # assign all the previous token embeddings upto current token position to key and
+        # value variables for Attention calculation
+        key= self.k_cache[:B, :, :self.cache_len + T_new, :]
+        val= self.v_cache[:B, :, :self.cache_len + T_new, :]
 
-        return self.k_cache, self.v_cache
+        self.cache_len += T_new
+
+        return key, val
 
 
 
