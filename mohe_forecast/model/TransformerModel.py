@@ -399,13 +399,13 @@ class KVCache:
         """
         Append T new KV vectors.
         """
-        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, n_heads, T, d_head)"
+        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, n_kv_heads, T, d_head)"
         B, nh, T_new, dh= k.shape
         assert nh == self.n_heads, f"n_kv_heads mismatch: {nh} vs {self.n_heads}"
         assert dh == self.d_head,  f"d_head mismatch: {dh} vs {self.d_head}"
 
-        if T_new > self.block_size:
-            raise ValueError(f"Sequence ({T_new}) cannot exceed block_size ({self.block_size})")
+        if T_new + self.cache_len > self.block_size:
+            raise ValueError(f"Sequence length cannot exceed block_size ({self.block_size})")
 
         # nothing to do -> return current cache
         if T_new == 0:
