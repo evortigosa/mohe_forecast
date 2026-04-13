@@ -111,6 +111,7 @@ def build_parser():
     parser.add_argument("--min-lr", type=float, default=1.2e-4, help="Min learning rate")
     parser.add_argument("--warmup-portion",type=float, default=0.1, help="Percentage of steps as warmup")
     parser.add_argument("--weight-decay",  type=float, default=1e-4, help="AdamW weight_decay")
+    parser.add_argument("--loss", type=str, default='huber', help="Loss criterion can be HuberLoss or MSELoss")
     parser.add_argument("--stop-patience", type=int, default=5, help="Number of patience epochs for early stopping")
     parser.add_argument("--stop-min",   type=float, default=1e-6, help="Min delta for early stopping")
     parser.add_argument("--train", action=argparse.BooleanOptionalAction, default=True,
@@ -221,7 +222,7 @@ def setup_data_loaders(
 def setup_trainer(
     model, device, use_fused, train_loader, val_loader, test_loader, scaler_obj, time_covariates,
     checkpoint_dir, filename, epochs=10, max_lr=3.2e-3, min_lr=1.2e-4, warmup_portion=0.1, weight_decay=1e-4,
-    stop_patience=5, stop_min_delta=1e-6, verbose=True
+    loss='huber', stop_patience=5, stop_min_delta=1e-6, verbose=True
 ):
     config= model.config
     steps = len(train_loader) * epochs
@@ -237,9 +238,11 @@ def setup_trainer(
     # terminate training when the validation loss (per epoch) does not improve
     early_stopping= EarlyStopping(patience=stop_patience, min_delta=stop_min_delta)
 
-    # See https://arxiv.org/abs/2409.16040
-    criterion= nn.HuberLoss(reduction='none', delta=2.0)
-    # criterion= nn.MSELoss(reduction='none')
+    if loss.lower() == 'huber':
+        # See https://arxiv.org/abs/2409.16040
+        criterion= nn.HuberLoss(reduction='none', delta=2.0)
+    else:
+        criterion= nn.MSELoss(reduction='none')
     aux_criterion= LoadBalancingLoss(config.n_experts, config.top_k_experts, alpha=0.02)
 
     trainer_obj= Trainer(
@@ -291,13 +294,14 @@ def main(device, use_fused, use_flashattn):
     min_lr= args.min_lr
     warmup_portion= args.warmup_portion
     weight_decay  = args.weight_decay
+    loss= args.loss
     stop_patience = args.stop_patience
     stop_min_delta= args.stop_min
 
     trainer= setup_trainer(
         ts_model, device, use_fused, enc_train_loader, enc_val_loader, test_loader_96, enc_tds_scaler,
         model_config.multi_modal, check_dir, check_file, epochs, max_lr, min_lr, warmup_portion,
-        weight_decay, stop_patience, stop_min_delta, verbose
+        weight_decay, loss, stop_patience, stop_min_delta, verbose
     )
 
     use_bf16= args.bf16
