@@ -61,7 +61,7 @@ def parse_value(value:str):
 
     try:
         return ast.literal_eval(value)
-    except ValueError:
+    except Exception:
         return value
 
 
