@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from dataclasses import fields, replace
 from mohe_forecast.model import TSFTransformer
-from mohe_forecast.model.Config import TinyConfig, SmallConfig, BaseConfig, LargeConfig
+from mohe_forecast.model.Config import TinyConfig, SmallConfig, BaseConfig, LargeConfig, UltraConfig
 from mohe_forecast.data_provider.loaders import get_ett_data_loaders, get_custom_data_loaders
 from mohe_forecast.utils import CosineLRDecay, EarlyStopping, LoadBalancingLoss, Trainer
 from mohe_forecast.utils.Metrics import eval_forecast_horizons
@@ -19,7 +19,8 @@ from mohe_forecast.utils.Metrics import eval_forecast_horizons
 
 
 CONFIG_MAP= {
-    "base": BaseConfig, "tiny": TinyConfig, "small": SmallConfig, "large": LargeConfig,
+    "base": BaseConfig, "tiny": TinyConfig, "small": SmallConfig,
+    "large": LargeConfig, "ultra": UltraConfig,
 }
 DEVICE= 'cuda' if torch.cuda.is_available() else 'cpu'
 USE_FUSED= False
