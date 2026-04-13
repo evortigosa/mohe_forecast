@@ -140,8 +140,8 @@ def setup_model_from_checkpoint(filename, checkpoint_dir, device, verbose=True):
 
 
 def setup_model(model_size, device, args):
-    if model_size.lower() not in ('tiny', 'small', 'base', 'large'):
-        raise ValueError("model_size must be one of: 'tiny', 'small', 'base', 'large'.")
+    if model_size.lower() not in ('tiny', 'small', 'base', 'large', 'ultra'):
+        raise ValueError("model_size must be one of: 'tiny', 'small', 'base', 'large', 'ultra'.")
 
     config_cls= CONFIG_MAP[model_size.lower()]
     config= config_cls()
