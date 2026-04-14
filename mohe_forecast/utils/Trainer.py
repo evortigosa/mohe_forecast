@@ -30,7 +30,7 @@ class Trainer:
     def __init__(self, model, device, train_loader, train_ds_scaler, val_loader, test_loader,
                  criterion, optimizer, scheduler=None, aux_criterion=None, early_stopping=None,
                  use_time_features=False, do_validation=True, augmentation=None, checkpointing=True,
-                 checkpoint_dir=None, filename=None, verbose=False) -> None:
+                 checkpoint_dir=None, filename=None, verbose=False, disable_tqdm=False) -> None:
         self.model= model
         self.device= torch.device(device)
         self.train_loader= train_loader
@@ -48,6 +48,7 @@ class Trainer:
         self.checkpoint_dir= checkpoint_dir if checkpoint_dir is not None else 'checkpoints'
         self.filename= filename if filename is not None else 'tsft_checkpoint'
         self.verbose= verbose
+        self.disable_tqdm= disable_tqdm
         # track statistics
         self.train_losses= []
         self.val_losses= []
@@ -98,7 +99,7 @@ class Trainer:
         epoch_lr= 0.0
 
         # --- training steps ---
-        for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}"):
+        for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}", disable=self.disable_tqdm):
             self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
@@ -173,7 +174,7 @@ class Trainer:
         epoch_lr= 0.0
 
         # --- training steps ---
-        for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}"):
+        for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}", disable=self.disable_tqdm):
             self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
@@ -249,7 +250,7 @@ class Trainer:
         n_samples= 0
 
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc='Validating'):
+            for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
                 # --- minibatch construction ---
                 if self.use_time_features:
                     data, target, data_time, _= batch
@@ -371,7 +372,7 @@ class Trainer:
         all_logits, all_trues= [], []
 
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc='Testing'):
+            for batch in tqdm(test_loader, desc='Testing', disable=self.disable_tqdm):
                 # --- minibatch construction ---
                 if self.use_time_features:
                     data, target, data_time, target_time= batch

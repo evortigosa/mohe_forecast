@@ -437,8 +437,8 @@ class TSFTransformer(nn.Module):
             optim_groups, lr=learning_rate, betas=betas, eps=1e-10, fused=use_fused
         )
         if verbose:
-            print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params} parameters")
-            print(f"Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params} parameters")
-            print(f"Using fused AdamW: {use_fused}")
+            print(f"[INFO] Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params} parameters")
+            print(f"[INFO] Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params} parameters")
+            print(f"[INFO] Using fused AdamW: {use_fused}")
 
         return optimizer
