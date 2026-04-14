@@ -311,14 +311,14 @@ class Trainer:
                 )
                 if self.verbose:
                     print(f'Train loss: {train_loss:.4f}')
-                    print(f'Valid loss: {val_loss:.4f} | dt/epoch: {dt*1000:.2f}ms')
+                    print(f'Valid loss: {val_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt*1000:.2f}ms')
             else:  # val_loss is None
                 self._log.info(
                     "train | epoch=%d/%d | train_loss=%.6f | val_loss not computed | lr=%.3e | dt=%.2fs",
                     epoch + 1, epochs, train_loss, epoch_lr, dt
                 )
                 if self.verbose:
-                    print(f'Train loss: {train_loss:.4f} | dt/epoch: {dt*1000:.2f}ms')
+                    print(f'Train loss: {train_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt*1000:.2f}ms')
 
             if val_loss is not None:
                 if val_loss < best_val_loss:
