@@ -111,6 +111,8 @@ def build_parser():
     parser.add_argument("--min-lr", type=float, default=1.2e-4, help="Min learning rate")
     parser.add_argument("--warmup-portion",type=float, default=0.1, help="Percentage of steps as warmup")
     parser.add_argument("--weight-decay",  type=float, default=1e-4, help="AdamW weight_decay")
+    parser.add_argument("--setup-opt", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable or disable model setup_optimizer on weight decayed parameters")
     parser.add_argument("--loss", type=str, default='huber', help="Loss criterion can be HuberLoss or MSELoss")
     parser.add_argument("--stop-patience", type=int, default=5, help="Number of patience epochs for early stopping")
     parser.add_argument("--stop-min",   type=float, default=1e-6, help="Min delta for early stopping")
@@ -120,6 +122,8 @@ def build_parser():
                         help="Enable or disable bf16")
     parser.add_argument("--test", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable model test")
+    parser.add_argument("--show-tqdm", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable or disable tqdm status bar on training/test")
 
     return parser
 
@@ -222,17 +226,22 @@ def setup_data_loaders(
 def setup_trainer(
     model, device, use_fused, train_loader, val_loader, test_loader, scaler_obj, time_covariates,
     checkpoint_dir, filename, epochs=10, max_lr=3.2e-3, min_lr=1.2e-4, warmup_portion=0.1, weight_decay=1e-4,
-    loss='huber', stop_patience=5, stop_min_delta=1e-6, verbose=True
+    setup_optimizer=False, loss='huber', stop_patience=5, stop_min_delta=1e-6, verbose=True, disable_tqdm=True,
 ):
     config= model.config
     steps = len(train_loader) * epochs
     warmup_steps= steps * warmup_portion
     max_steps= steps
 
-    optimizer= torch.optim.AdamW(
-        model.parameters(), lr=max_lr, betas=(0.9, 0.95), weight_decay=weight_decay,
-        eps=1e-10, fused=use_fused
-    )
+    if setup_optimizer:
+        optimizer= model.setup_optimizer(
+            learning_rate=max_lr, weight_decay=weight_decay, betas=(0.9, 0.95), verbose=verbose
+        )
+    else:
+        optimizer= torch.optim.AdamW(
+            model.parameters(), lr=max_lr, betas=(0.9, 0.95), weight_decay=weight_decay,
+            eps=1e-10, fused=use_fused
+        )
     # for decreasing learning rate -- the CosineLRDecay is designed to be used per step
     scheduler= CosineLRDecay(optimizer, min_lr, max_lr, warmup_steps, max_steps)
     # terminate training when the validation loss (per epoch) does not improve
@@ -248,7 +257,8 @@ def setup_trainer(
     trainer_obj= Trainer(
         model, device, train_loader, scaler_obj, val_loader, test_loader, criterion, optimizer,
         scheduler, aux_criterion, early_stopping, time_covariates, do_validation=True,
-        checkpointing=True, checkpoint_dir=checkpoint_dir, filename=filename, verbose=verbose
+        checkpointing=True, checkpoint_dir=checkpoint_dir, filename=filename, verbose=verbose,
+        disable_tqdm=disable_tqdm,
     )
 
     return trainer_obj
@@ -294,14 +304,16 @@ def main(device, use_fused, use_flashattn):
     min_lr= args.min_lr
     warmup_portion= args.warmup_portion
     weight_decay  = args.weight_decay
+    setup_opt= args.setup_opt
     loss= args.loss
     stop_patience = args.stop_patience
     stop_min_delta= args.stop_min
+    disable_tqdm= not args.show_tqdm
 
     trainer= setup_trainer(
         ts_model, device, use_fused, enc_train_loader, enc_val_loader, test_loader_96, enc_tds_scaler,
         model_config.multi_modal, check_dir, check_file, epochs, max_lr, min_lr, warmup_portion,
-        weight_decay, loss, stop_patience, stop_min_delta, verbose
+        weight_decay, setup_opt, loss, stop_patience, stop_min_delta, verbose, disable_tqdm
     )
 
     use_bf16= args.bf16
