@@ -613,9 +613,11 @@ class Trainer:
 
         plt.tight_layout()
         if save_charts and as_pdf:
-            plt.savefig(f'{save_path}.pdf', dpi=300, pad_inches=0.01, bbox_inches="tight")
+            save_path= f'{save_path}.pdf'
+            plt.savefig(save_path, dpi=300, pad_inches=0.01, bbox_inches="tight")
         elif save_charts:
-            plt.savefig(f'{save_path}.svg', pad_inches=0.01, bbox_inches="tight")
+            save_path= f'{save_path}.svg'
+            plt.savefig(save_path, pad_inches=0.01, bbox_inches="tight")
         if save_charts:
             self._log.warning(
                 "plot_results | Training charts were saved at: %s", save_path
