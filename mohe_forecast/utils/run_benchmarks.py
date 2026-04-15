@@ -116,6 +116,8 @@ def build_parser():
     parser.add_argument("--loss", type=str, default='huber', help="Loss criterion can be HuberLoss or MSELoss")
     parser.add_argument("--stop-patience", type=int, default=5, help="Number of patience epochs for early stopping")
     parser.add_argument("--stop-min",   type=float, default=1e-6, help="Min delta for early stopping")
+    parser.add_argument("--clip-grad", type=parse_value, default=None,
+                        help="Set a value (float) to clip_grad_norm_ on training")
     parser.add_argument("--train", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable model training")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False,
@@ -317,11 +319,12 @@ def main(device, use_fused, use_flashattn):
     )
 
     use_bf16= args.bf16
+    clip_grad= args.clip_grad
     do_train= args.train
     do_test = args.test
 
     if do_train:
-        trainer.train(epochs, use_bf16=use_bf16)
+        trainer.train(epochs, use_bf16=use_bf16, clip_grad=clip_grad)
         trainer.plot_results(show_plot=False, save_charts=True, file_name=plot_file)
 
     if do_test:
