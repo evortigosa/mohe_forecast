@@ -10,10 +10,6 @@ from .DataLoaders import Dataset_ETT, Dataset_Custom, Dataset_GlobalTemp
 
 
 
-"""
-ETT DataLoaders
-"""
-
 def loaders_safety_checks(patch_width, block_size, out_width, test_horizons):
     # --- safety checks ---
     if patch_width <= 0 or block_size <= 0:
@@ -38,6 +34,12 @@ def loaders_safety_checks(patch_width, block_size, out_width, test_horizons):
             raise ValueError(f"Invalid horizon {h}; all horizons must be positive integers.")
 
     return test_horizons
+
+
+
+"""
+ETT DataLoaders
+"""
 
 
 def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, from_csv, btc_size,
@@ -88,6 +90,7 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, from_csv
 
 
     """ ----- setup for getting training and val data to feed Encoders ----- """
+    # int(patch_width * out_width) == 0, generate train/val for SSL mode (data == target)
     E_HISTORY_TAIL= block_size - int(patch_width * out_width)
     E_OUTPUT_WIDTH= int(patch_width * out_width)  # predict a sequence of time-patches
     enc_size_tv= [INPUT_WIDTH, E_HISTORY_TAIL, E_OUTPUT_WIDTH]
@@ -116,12 +119,20 @@ def get_ett_data_loaders(ett_root_path, dataset_name_1, dataset_name_2, from_csv
 
     """ ----- setup for test data - Encoders/Decoders ----- """
     # forecast horizons: {96, 192, 336, 720}
-    F_HISTORY_TAIL= 0
     test_loader_ett_1= {}
     test_loader_ett_2= {}
 
     for horizon in test_horizons:
-        size_te= [INPUT_WIDTH, F_HISTORY_TAIL, horizon]
+        if int(patch_width * out_width) > 0:
+            F_INPUT_WIDTH = INPUT_WIDTH
+            F_HISTORY_TAIL= 0
+            F_OUTPUT_WIDTH= horizon
+        else:  # int(patch_width * out_width) == 0, generate test for SSL mode (data == target)
+            F_INPUT_WIDTH = horizon
+            F_HISTORY_TAIL= horizon
+            F_OUTPUT_WIDTH= 0
+
+        size_te= [F_INPUT_WIDTH, F_HISTORY_TAIL, F_OUTPUT_WIDTH]
 
         test_ds_ett_1= Dataset_ETT(
             root_path=ett_root_path, data_path=dataset_name_1, from_csv=from_csv, split='test', size=size_te,
@@ -206,6 +217,7 @@ def get_custom_data_loaders(root_path, dataset_name, from_csv, btc_size, time_co
 
 
     """ ----- setup for getting training and val data to feed Encoders ----- """
+    # int(patch_width * out_width) == 0, generate train/val for SSL mode (data == target)
     E_HISTORY_TAIL= block_size - int(patch_width * out_width)
     E_OUTPUT_WIDTH= int(patch_width * out_width)  # predict a sequence of time-patches
     enc_size_tv= [INPUT_WIDTH, E_HISTORY_TAIL, E_OUTPUT_WIDTH]
@@ -223,11 +235,19 @@ def get_custom_data_loaders(root_path, dataset_name, from_csv, btc_size, time_co
 
     """ ----- setup for test data - Encoders/Decoders ----- """
     # forecast horizons: {96, 192, 336, 720}
-    F_HISTORY_TAIL= 0
     test_loader= {}
 
     for horizon in test_horizons:
-        size_te= [INPUT_WIDTH, F_HISTORY_TAIL, horizon]
+        if int(patch_width * out_width) > 0:
+            F_INPUT_WIDTH = INPUT_WIDTH
+            F_HISTORY_TAIL= 0
+            F_OUTPUT_WIDTH= horizon
+        else:  # int(patch_width * out_width) == 0, generate test for SSL mode (data == target)
+            F_INPUT_WIDTH = horizon
+            F_HISTORY_TAIL= horizon
+            F_OUTPUT_WIDTH= 0
+
+        size_te= [F_INPUT_WIDTH, F_HISTORY_TAIL, F_OUTPUT_WIDTH]
 
         test_ds= Dataset_Custom(
             root_path=root_path, data_path=dataset_name, from_csv=from_csv, split='test', size=size_te,
@@ -300,6 +320,7 @@ def get_global_temp_data_loaders(root_path='./global_temp', data_path='temp_glob
 
 
     """ ----- setup for getting training and val data to feed Encoders ----- """
+    # int(patch_width * out_width) == 0, generate train/val for SSL mode (data == target)
     E_HISTORY_TAIL= block_size - int(patch_width * out_width)
     E_OUTPUT_WIDTH= int(patch_width * out_width)  # predict a sequence of time-patches
     enc_size_tv= [INPUT_WIDTH, E_HISTORY_TAIL, E_OUTPUT_WIDTH]
@@ -320,11 +341,19 @@ def get_global_temp_data_loaders(root_path='./global_temp', data_path='temp_glob
 
     """ ----- setup for test data - Encoders/Decoders ----- """
     # forecast horizons: {96, 192, 336, 720}
-    F_HISTORY_TAIL= 0
     test_loader= {}
 
     for horizon in test_horizons:
-        size_te= [INPUT_WIDTH, F_HISTORY_TAIL, horizon]
+        if int(patch_width * out_width) > 0:
+            F_INPUT_WIDTH = INPUT_WIDTH
+            F_HISTORY_TAIL= 0
+            F_OUTPUT_WIDTH= horizon
+        else:  # int(patch_width * out_width) == 0, generate test for SSL mode (data == target)
+            F_INPUT_WIDTH = horizon
+            F_HISTORY_TAIL= horizon
+            F_OUTPUT_WIDTH= 0
+
+        size_te= [F_INPUT_WIDTH, F_HISTORY_TAIL, F_OUTPUT_WIDTH]
 
         test_ds= Dataset_GlobalTemp(
             root_path, data_path, time_path, split='test', size=size_te, features='S', target=0,
@@ -332,6 +361,7 @@ def get_global_temp_data_loaders(root_path='./global_temp', data_path='temp_glob
             data_cleaner=data_cleaner, verbose=verbose
         )
         test_loader[horizon]= DataLoader(test_ds,  batch_size=btc_size, shuffle=False)
+
 
     """ DataLoaders """
     dec_train_loader= DataLoader(dec_train_ds, batch_size=btc_size, shuffle=True)
