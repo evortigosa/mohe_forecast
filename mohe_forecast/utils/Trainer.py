@@ -88,7 +88,7 @@ class Trainer:
         return logger
 
 
-    def train_one_epoch(self, epoch):
+    def train_one_epoch(self, epoch, clip_grad=None):
         """
         Train the model for one epoch, returning the training loss and learning rate.
         """
@@ -136,7 +136,8 @@ class Trainer:
 
             # --- backward pass to calculate the gradients ---
             loss.backward()
-            #torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            if clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_grad)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
@@ -161,7 +162,7 @@ class Trainer:
         return train_loss, epoch_lr
 
 
-    def train_one_epoch_bf16(self, epoch):
+    def train_one_epoch_bf16(self, epoch, clip_grad=None):
         """
         Train the model for one epoch using bfloat16, returning the training loss and learning rate.
         """
@@ -215,7 +216,8 @@ class Trainer:
             # gradients computed in BF16, but accumulation and params remain TF32
             # BF16 does not need loss scaling with torch.amp.GradScaler()
             loss.backward()
-            #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_grad)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
@@ -274,7 +276,7 @@ class Trainer:
         return val_loss
 
 
-    def train(self, epochs, eval_interval=1, use_bf16=False) -> None:
+    def train(self, epochs, eval_interval=1, use_bf16=False, clip_grad=None) -> None:
         """
         Train the model for a specified number of epochs, performing validation and checkpointing.
         """
@@ -289,9 +291,9 @@ class Trainer:
             start= time.time()
 
             if use_bf16:
-                train_loss, epoch_lr= self.train_one_epoch_bf16(epoch+1)
+                train_loss, epoch_lr= self.train_one_epoch_bf16(epoch+1, clip_grad)
             else:
-                train_loss, epoch_lr= self.train_one_epoch(epoch+1)
+                train_loss, epoch_lr= self.train_one_epoch(epoch+1, clip_grad)
             self.train_losses.append(train_loss)
             self.lr_hist.append(epoch_lr)
 
