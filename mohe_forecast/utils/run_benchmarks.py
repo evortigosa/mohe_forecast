@@ -176,11 +176,11 @@ def setup_model(model_size, device, args):
 
     model= TSFTransformer.from_config(config).to(device)
 
-    return model, config
+    return model, model.config
 
 
 def setup_data_loaders(
-    btc_size, root_path, dataset_name, from_csv, multi_modal, patch_width, block_size, width_factor
+    btc_size, root_path, dataset_name, from_csv, multi_modal, patch_width, block_size, width_factor, is_causal=False
 ):
     if dataset_name.lower() in {'ettm1','ettm2','etth1','etth2'}:
         root_path= 'https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/'  # official ETT data repo
@@ -200,7 +200,7 @@ def setup_data_loaders(
             dataset_name_2= 'ETTh1'
 
         (
-            _, _, _, _, _, _,
+            dec_train_loader, dec_val_loader, _, _, dec_tds_scaler, _,
             enc_train_loader, enc_val_loader, _, _, enc_tds_scaler, _,
             test_loader_96, test_loader_192, test_loader_336, test_loader_720, _, _, _, _,
 
@@ -210,7 +210,7 @@ def setup_data_loaders(
         )
     else:
         (
-            _, _, _,
+            dec_train_loader, dec_val_loader, dec_tds_scaler,
             enc_train_loader, enc_val_loader, enc_tds_scaler,
             test_loader_96, test_loader_192, test_loader_336, test_loader_720,
 
@@ -218,7 +218,11 @@ def setup_data_loaders(
             root_path, dataset_name, from_csv, btc_size, multi_modal, patch_width,
             block_size, width_factor
         )
-
+    if is_causal:
+        return (
+            dec_train_loader, dec_val_loader, dec_tds_scaler,
+            test_loader_96, test_loader_192, test_loader_336, test_loader_720,
+        )
     return (
         enc_train_loader, enc_val_loader, enc_tds_scaler,
         test_loader_96, test_loader_192, test_loader_336, test_loader_720,
@@ -290,16 +294,16 @@ def main(device, use_fused, use_flashattn):
     from_csv= args.from_csv
 
     (
-        enc_train_loader, enc_val_loader, enc_tds_scaler,
+        train_loader, val_loader, tds_scaler,
         test_loader_96, test_loader_192, test_loader_336, test_loader_720,
 
     )= setup_data_loaders(
         btc_size, root_path, dataset_name, from_csv, model_config.multi_modal, model_config.patch_width,
-        model_config.block_size, model_config.width_factor
+        model_config.block_size, model_config.width_factor, model_config.is_causal
     )
     if verbose:
-        print(f"[INFO] {dataset_name} data -- number of batches (train, val, test-96): {len(enc_train_loader)}, "
-              f"{len(enc_val_loader)}, {len(test_loader_96)}")
+        print(f"[INFO] {dataset_name} data -- number of batches (train, val, test-96): {len(train_loader)}, "
+              f"{len(val_loader)}, {len(test_loader_96)}")
 
     epochs= args.epochs
     max_lr= args.max_lr
@@ -313,7 +317,7 @@ def main(device, use_fused, use_flashattn):
     disable_tqdm= not args.show_tqdm
 
     trainer= setup_trainer(
-        ts_model, device, use_fused, enc_train_loader, enc_val_loader, test_loader_96, enc_tds_scaler,
+        ts_model, device, use_fused, train_loader, val_loader, test_loader_96, tds_scaler,
         model_config.multi_modal, check_dir, check_file, epochs, max_lr, min_lr, warmup_portion,
         weight_decay, setup_opt, loss, stop_patience, stop_min_delta, verbose, disable_tqdm
     )
