@@ -338,6 +338,8 @@ class Trainer:
                             "train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f",
                             epoch + 1, avg_val_loss
                         )
+                        if self.verbose:
+                            print(f'[WARNING] Early stopping triggered during training at epoch {epoch+1}')
                         break
 
         if val_loss is not None:
@@ -621,7 +623,7 @@ class Trainer:
             save_path= f'{save_path}.svg'
             plt.savefig(save_path, pad_inches=0.01, bbox_inches="tight")
         if save_charts:
-            self._log.warning(
+            self._log.info(
                 "plot_results | Training charts were saved at: %s", save_path
             )
             if self.verbose:

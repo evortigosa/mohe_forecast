@@ -56,10 +56,10 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop= True
                 self._log.warning(
-                    "early_stopping_triggered | non_finite_metric | epoch=%d", epoch
+                    "early_stopping | non_finite_metric | epoch=%d", epoch
                 )
                 if self.verbose:
-                    print(f"[EarlyStopping] Stopping: non-finite metric at epoch {epoch}.")
+                    print(f"[WARNING] Early stopping: non-finite metric at epoch {epoch}.")
 
             return self.early_stop
 
@@ -74,9 +74,9 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop= True
                 self._log.warning(
-                    "early_stopping_triggered | no_improvement | epoch=%d", epoch
+                    "early_stopping | no_improvement | epoch=%d", epoch
                 )
                 if self.verbose:
-                    print(f"[EarlyStopping] Early stopping triggered at epoch {epoch}.")
+                    print(f"[WARNING] Early stopping: no improvement at epoch {epoch}.")
 
         return self.early_stop
