@@ -122,10 +122,16 @@ def build_parser():
                         help="Enable or disable model training")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable or disable bf16")
+    parser.add_argument("--moe-metrics", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable or disable MoE tracking metrics")
     parser.add_argument("--test", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable model test")
     parser.add_argument("--show-tqdm", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable tqdm status bar on training/test")
+    parser.add_argument("--save-plots", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable or disable saving training/validation plots")
+    parser.add_argument("--plot-cut-first", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable or disable first epoch results in plot files")
 
     return parser
 
@@ -324,12 +330,20 @@ def main(device, use_fused, use_flashattn):
 
     use_bf16= args.bf16
     clip_grad= args.clip_grad
+    moe_metrics= args.moe_metrics
     do_train= args.train
     do_test = args.test
+    save_plots= args.save_plots
+    cut_first= args.plot_cut_first
 
     if do_train:
-        trainer.train(epochs, use_bf16=use_bf16, clip_grad=clip_grad)
-        trainer.plot_results(show_plot=False, save_charts=True, file_name=plot_file)
+        trainer.train(epochs, use_bf16=use_bf16, clip_grad=clip_grad, get_moe_metrics=moe_metrics)
+        if save_plots:
+            trainer.plot_results(cut_first_epoch=cut_first, show_plot=False, save_charts=True, file_name=f"{plot_file}_losses")
+            trainer.plot_expert_usage_global(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage")
+            trainer.plot_expert_routing_diagnostics(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_routing")
+            trainer.plot_expert_usage_layerwise(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_layerwise")
+            trainer.plot_expert_usage_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap")
 
     if do_test:
         _, _= trainer.load_checkpoint(filename=None, checkpoint_dir=check_dir)
