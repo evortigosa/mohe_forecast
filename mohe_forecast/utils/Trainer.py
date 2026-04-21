@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import logging
 from dataclasses import asdict
+from .ExpertUsageTracker import ExpertUsageTracker
 from ..model.TSFT import TSFTransformer
 from tqdm import tqdm
 
@@ -53,6 +54,7 @@ class Trainer:
         self.train_losses= []
         self.val_losses= []
         self.lr_hist= []
+        self.expert_traker= None
         # train_ds_scaler for denormalization
         self.train_ds_scaler= train_ds_scaler
         # --- minimal logging ---
@@ -88,7 +90,7 @@ class Trainer:
         return logger
 
 
-    def train_one_epoch(self, epoch, clip_grad=None):
+    def train_one_epoch(self, epoch, clip_grad=None, get_moe_metrics=False):
         """
         Train the model for one epoch, returning the training loss and learning rate.
         """
@@ -122,9 +124,18 @@ class Trainer:
             losses= self.criterion(logits, target)
             loss= torch.mean(losses)
 
+            # sample‑weighted average loss
+            train_loss += float(loss.item()) * data.size(0)
+            n_samples += data.size(0)
+
             if self.aux_criterion is not None:
-                aux_loss= self.aux_criterion(router_logits, padding_mask)
+                aux_loss, global_metrics, layer_metrics= self.aux_criterion(
+                    router_logits, padding_mask, get_moe_metrics
+                )
                 loss= loss + aux_loss
+
+                if get_moe_metrics and self.expert_traker is not None:
+                    self.expert_traker.update(global_metrics, layer_metrics)
 
             # check loss finite
             if not torch.isfinite(loss).all():
@@ -142,10 +153,6 @@ class Trainer:
             # --- update the parameters using the gradient ---
             self.optimizer.step()
 
-            # sample‑weighted average loss
-            train_loss += float(loss.item()) * data.size(0)
-            n_samples += data.size(0)
-
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -162,7 +169,7 @@ class Trainer:
         return train_loss, epoch_lr
 
 
-    def train_one_epoch_bf16(self, epoch, clip_grad=None):
+    def train_one_epoch_bf16(self, epoch, clip_grad=None, get_moe_metrics=False):
         """
         Train the model for one epoch using bfloat16, returning the training loss and learning rate.
         """
@@ -200,9 +207,18 @@ class Trainer:
                 losses= self.criterion(logits, target)
                 loss= torch.mean(losses)
 
+                # sample‑weighted average loss
+                train_loss += float(loss.item()) * data.size(0)
+                n_samples += data.size(0)
+
                 if self.aux_criterion is not None:
-                    aux_loss= self.aux_criterion(router_logits, padding_mask)
+                    aux_loss, global_metrics, layer_metrics= self.aux_criterion(
+                        router_logits, padding_mask, get_moe_metrics
+                    )
                     loss= loss + aux_loss
+
+                    if get_moe_metrics and self.expert_traker is not None:
+                        self.expert_traker.update(global_metrics, layer_metrics)
 
             # check loss finite
             if not torch.isfinite(loss).all():
@@ -221,10 +237,6 @@ class Trainer:
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
-
-            # sample‑weighted average loss
-            train_loss += float(loss.item()) * data.size(0)
-            n_samples += data.size(0)
 
             # per-step scheduler
             if self.scheduler is not None:
@@ -276,37 +288,47 @@ class Trainer:
         return val_loss
 
 
-    def train(self, epochs, eval_interval=1, use_bf16=False, clip_grad=None) -> None:
+    def train(self, epochs, eval_interval=1, use_bf16=False, clip_grad=None, get_moe_metrics=False) -> None:
         """
         Train the model for a specified number of epochs, performing validation and checkpointing.
         """
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
+        if get_moe_metrics and self.expert_traker is None:
+            self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
+
         best_val_loss= float('inf')
         best_epoch= -1
-        val_loss= None
+        val_loss= 10.
+        did_validation= False
 
         for epoch in range(epochs):
             start= time.time()
+            if self.expert_traker is not None:
+                self.expert_traker.reset_epoch()
 
             if use_bf16:
-                train_loss, epoch_lr= self.train_one_epoch_bf16(epoch+1, clip_grad)
+                train_loss, epoch_lr= self.train_one_epoch_bf16(epoch+1, clip_grad, get_moe_metrics)
             else:
-                train_loss, epoch_lr= self.train_one_epoch(epoch+1, clip_grad)
+                train_loss, epoch_lr= self.train_one_epoch(epoch+1, clip_grad, get_moe_metrics)
             self.train_losses.append(train_loss)
             self.lr_hist.append(epoch_lr)
 
             if self.do_validation and (epoch % eval_interval == 0 or epoch == epochs-1):
                 val_loss= self.validate()
-                self.val_losses.append(val_loss)
+                did_validation= True
             else:
-                val_loss= None
+                did_validation= False
+            self.val_losses.append(val_loss)
+
+            if self.expert_traker is not None:
+                self.expert_traker.finalize_epoch()
 
             end= time.time()
             dt = end - start
 
-            if val_loss is not None:
+            if did_validation:
                 self._log.info(
                     "train | epoch=%d/%d | train_loss=%.6f | val_loss=%.6f | lr=%.3e | dt=%.2fs",
                     epoch + 1, epochs, train_loss, val_loss, epoch_lr, dt
@@ -314,7 +336,7 @@ class Trainer:
                 if self.verbose:
                     print(f'Train loss: {train_loss:.4f}')
                     print(f'Valid loss: {val_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt*1000:.2f}ms')
-            else:  # val_loss is None
+            else:  # did_validation is False
                 self._log.info(
                     "train | epoch=%d/%d | train_loss=%.6f | val_loss not computed | lr=%.3e | dt=%.2fs",
                     epoch + 1, epochs, train_loss, epoch_lr, dt
@@ -322,7 +344,7 @@ class Trainer:
                 if self.verbose:
                     print(f'Train loss: {train_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt*1000:.2f}ms')
 
-            if val_loss is not None:
+            if did_validation:
                 if val_loss < best_val_loss:
                     # Save model if it's the best so far
                     best_val_loss= val_loss
@@ -342,7 +364,7 @@ class Trainer:
                             print(f'[WARNING] Early stopping triggered during training at epoch {epoch+1}')
                         break
 
-        if val_loss is not None:
+        if did_validation:
             self._log.info("train | Best Validation Loss: %.6f | Epoch: %d", best_val_loss, best_epoch + 1)
             if self.verbose:
                 print(f'Best Validation Loss: {best_val_loss:.4f} (Epoch {best_epoch + 1})')
@@ -351,7 +373,7 @@ class Trainer:
                 self.save_checkpoint(best_epoch, best_val_loss)
 
 
-    def test(self, test_loader=None, inverse_transform=False, test_criterion=nn.MSELoss(reduction='none')):
+    def test(self, test_loader=None, test_criterion=nn.MSELoss(reduction='none'), inverse_transform=False):
         """
         Test the model on a test set.
         Returns the mean test loss, test predictions, and test labels.
@@ -368,6 +390,8 @@ class Trainer:
             mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1,-1,1).to(self.device)
         else:
             inverse_transform= False
+            scale_= 1.
+            mean_ = 0.
 
         self.model.eval()
         test_criterion= test_criterion if test_criterion is not None else self.criterion
@@ -412,13 +436,29 @@ class Trainer:
         return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
 
 
+    def get_checkpoint_path(self, filename:str, checkpoint_dir:str):
+
+        if (filename is not None) and (checkpoint_dir is None):
+            # assume that filename holds the complete checkpoint_path
+            checkpoint_path= os.path.join(filename)
+        elif (filename is None) and (checkpoint_dir is not None):
+            # filename takes the default value
+            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
+        else:
+            if (filename is None) and (checkpoint_dir is None):
+                checkpoint_dir= self.checkpoint_dir
+                filename= f'{self.filename}.pth'
+            checkpoint_path= os.path.join(str(checkpoint_dir), str(filename))
+
+        return str(checkpoint_path)
+
+
     def save_checkpoint(self, epoch, best_val_loss) -> None:
         """
         Save the model checkpoint to disk, including training history.
         """
-        checkpoint_dir= self.checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        checkpoint_path= self.get_checkpoint_path(f'{self.filename}.pth', self.checkpoint_dir)
         # construct checkpoint dictionary
         checkpoint= {
             'epoch': epoch,
@@ -429,6 +469,7 @@ class Trainer:
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'lr_hist': self.lr_hist,
+            'expert_traker': self.expert_traker.state_dict() if self.expert_traker is not None else None,
             'timestamp': time.time(),
         }
         try:
@@ -461,19 +502,9 @@ class Trainer:
         """
         This method loads the checkpoint from the given path and restores the model, optimizer
         (optional, when restore_optimizer=True), and training history.
-        - TODO: Fix dtype, device, and layout for optimizer state.
+        - TODO: Fix dtype, device, and layout for optimizer state loading.
         """
-        if (filename is not None) and (checkpoint_dir is None):
-            # assume that filename holds the complete checkpoint_path
-            checkpoint_path= os.path.join(filename)
-        elif (filename is None) and (checkpoint_dir is not None):
-            # filename takes the default value
-            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
-        else:
-            if (filename is None) and (checkpoint_dir is None):
-                checkpoint_dir= self.checkpoint_dir
-                filename= f'{self.filename}.pth'
-            checkpoint_path= os.path.join(checkpoint_dir, filename)
+        checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
 
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
@@ -498,6 +529,9 @@ class Trainer:
                         print("[WARNING] Checkpoint contains optimizer state, but self.optimizer is None: skipping optimizer restore.")
                 else:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    if self.scheduler is not None:
+                        self.scheduler.optimizer= self.optimizer
+
             # retrieve training metadata
             epoch= checkpoint['epoch']
             best_val_loss= checkpoint.get('best_val_loss', float('inf'))
@@ -505,6 +539,11 @@ class Trainer:
                 self.train_losses= checkpoint.get('train_losses', [])
                 self.val_losses= checkpoint.get('val_losses', [])
                 self.lr_hist= checkpoint.get('lr_hist', [])
+                self.expert_traker= None
+                tracker= checkpoint.get('expert_traker', None)
+                if tracker is not None:
+                    self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
+                    self.expert_traker.load_state_dict(tracker)
 
             self._log.info(
                 "load_checkpoint | Checkpoint loaded from '%s'. Resuming training with best validation loss of %.4f.",
@@ -528,17 +567,7 @@ class Trainer:
         """
         Build a model from a given checkpoint.
         """
-        if (filename is not None) and (checkpoint_dir is None):
-            # assume that filename holds the complete checkpoint_path
-            checkpoint_path= os.path.join(filename)
-        elif (filename is None) and (checkpoint_dir is not None):
-            # filename takes the default value
-            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
-        else:
-            if (filename is None) and (checkpoint_dir is None):
-                checkpoint_dir= self.checkpoint_dir
-                filename= f'{self.filename}.pth'
-            checkpoint_path= os.path.join(checkpoint_dir, filename)
+        checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
 
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
@@ -576,15 +605,38 @@ class Trainer:
             raise e
 
 
+    def save_plot(self, plt_obj, file_name, as_pdf, method_name, info_message) -> None:
+        plots_dir= f"{self.checkpoint_dir}/plots"
+        os.makedirs(plots_dir, exist_ok=True)
+        save_path= self.get_checkpoint_path(file_name, plots_dir)
+
+        plt_obj.tight_layout()
+        if as_pdf:
+            save_path= f'{save_path}.pdf'
+            plt_obj.savefig(save_path, dpi=300, pad_inches=0.01, bbox_inches="tight")
+        else:
+            save_path= f'{save_path}.svg'
+            plt_obj.savefig(save_path, pad_inches=0.01, bbox_inches="tight")
+
+        self._log.info(f"{method_name} | {info_message}: {save_path}")
+        if self.verbose:
+            print(f"[INFO] {info_message}: {save_path}")
+
+
     def plot_results(self, cut_first_epoch=False, show_plot=True, save_charts=False, as_pdf=False,
-                     file_name='training_results') -> None:
+                     file_name='training_results'):
         """
         Plot training metrics including training loss, validation loss, and learning rate history
-        over epochs. The results can be saved as checkpoint_dir/file_name.pdf.
+        over epochs. Plots can be saved as checkpoint_dir/file_name.
         """
-        checkpoint_dir= self.checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        save_path= os.path.join(checkpoint_dir, file_name)
+        method_name= "plot_results"
+
+        if len(self.train_losses) == 0:
+            info_message= "No training/validation history available to plot."
+            self._log.info(f"{method_name} | {info_message}")
+            if self.verbose:
+                print(f"[INFO] {info_message}")
+            return
 
         epochs= range(1, len(self.train_losses) + 1)
         if cut_first_epoch:
@@ -615,19 +667,238 @@ class Trainer:
         plt.legend()
         plt.grid(True, linestyle='--', alpha=0.7)
 
-        plt.tight_layout()
-        if save_charts and as_pdf:
-            save_path= f'{save_path}.pdf'
-            plt.savefig(save_path, dpi=300, pad_inches=0.01, bbox_inches="tight")
-        elif save_charts:
-            save_path= f'{save_path}.svg'
-            plt.savefig(save_path, pad_inches=0.01, bbox_inches="tight")
         if save_charts:
-            self._log.info(
-                "plot_results | Training charts were saved at: %s", save_path
-            )
+            self.save_plot(plt, file_name, as_pdf, method_name, "Training charts were saved at")
+        if show_plot:
+            plt.show()
+        plt.close()
+
+
+    def plot_expert_usage_global(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                 as_pdf=False, file_name="expert_usage_global"):
+        """
+        MoE metrics. Plot global expert hard/soft utilization over epochs.
+        Plots can be saved as checkpoint_dir/file_name.
+        """
+        method_name= "plot_expert_usage_global"
+
+        hard_hist, soft_hist= [], []
+        if self.expert_traker is not None:
+            hard_hist= self.expert_traker.history["epoch_hard_fraction"]
+            soft_hist= self.expert_traker.history["epoch_soft_fraction"]
+
+        if len(hard_hist) == 0 or len(soft_hist) == 0:
+            info_message= "No expert usage history available to plot."
+            self._log.info(f"{method_name} | {info_message}")
             if self.verbose:
-                print(f"[INFO] Training charts were saved at: {save_path}")
+                print(f"[INFO] {info_message}")
+            return
+
+        hard_hist= torch.stack(hard_hist).cpu()   # [n_epochs, E]
+        soft_hist= torch.stack(soft_hist).cpu()   # [n_epochs, E]
+
+        epochs= list(range(1, hard_hist.size(0) + 1))
+        if cut_first_epoch and len(epochs) > 1:
+            epochs= epochs[1:]
+            hard_hist= hard_hist[1:]
+            soft_hist= soft_hist[1:]
+
+        plt.figure(figsize=(14, 5))
+        plt.subplot(1, 2, 1)
+        for expert_id in range(hard_hist.size(1)):
+            plt.plot(
+                epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
+                label=f"Expert {expert_id}"
+            )
+        plt.title("Global Expert Hard Utilization")
+        plt.xlabel("Epochs")
+        plt.ylabel("Hard Fraction")
+        plt.legend(ncol=2 if hard_hist.size(1) > 6 else 1, fontsize=9)
+        plt.grid(True, linestyle="--", alpha=0.7)
+
+        plt.subplot(1, 2, 2)
+        for expert_id in range(soft_hist.size(1)):
+            plt.plot(
+                epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
+                label=f"Expert {expert_id}"
+            )
+        plt.title("Global Expert Soft Importance")
+        plt.xlabel("Epochs")
+        plt.ylabel("Soft Fraction")
+        plt.legend(ncol=2 if soft_hist.size(1) > 6 else 1, fontsize=9)
+        plt.grid(True, linestyle="--", alpha=0.7)
+
+        if save_charts:
+            self.save_plot(plt, file_name, as_pdf, method_name, "Expert usage charts were saved at")
+        if show_plot:
+            plt.show()
+        plt.close()
+
+
+    def plot_expert_routing_diagnostics(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                        as_pdf=False, file_name="expert_routing_diagnostics"):
+        """
+        MoE metrics. Plot global routing health metrics over epochs.
+        Plots can be saved as checkpoint_dir/file_name.
+        """
+        method_name= "plot_expert_routing_diagnostics"
+
+        entropy_hist, dead_hist, cv_hard_hist, cv_soft_hist= [], [], [], []
+        if self.expert_traker is not None:
+            entropy_hist= self.expert_traker.history["epoch_entropy"]
+            dead_hist   = self.expert_traker.history["epoch_dead_experts"]
+            cv_hard_hist= self.expert_traker.history["epoch_cv_hard"]
+            cv_soft_hist= self.expert_traker.history["epoch_cv_soft"]
+
+        if len(entropy_hist) == 0:
+            info_message= "No routing diagnostic history available to plot."
+            self._log.info(f"{method_name} | {info_message}")
+            if self.verbose:
+                print(f"[INFO] {info_message}")
+            return
+
+        epochs= list(range(1, len(entropy_hist) + 1))
+        if cut_first_epoch and len(epochs) > 1:
+            epochs= epochs[1:]
+            entropy_hist= entropy_hist[1:]
+            dead_hist= dead_hist[1:]
+            cv_hard_hist= cv_hard_hist[1:]
+            cv_soft_hist= cv_soft_hist[1:]
+
+        plt.figure(figsize=(14, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs, entropy_hist, label="Router Entropy", marker="o", linestyle="-")
+        plt.plot(epochs, dead_hist, label="Dead Experts", marker="o", linestyle="-")
+        plt.title("Routing Collapse Indicators")
+        plt.xlabel("Epochs")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.7)
+
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs, cv_hard_hist, label="CV Hard", marker="o", linestyle="-")
+        plt.plot(epochs, cv_soft_hist, label="CV Soft", marker="o", linestyle="-")
+        plt.title("Routing Imbalance")
+        plt.xlabel("Epochs")
+        plt.ylabel("Coefficient of Variation")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.7)
+
+        if save_charts:
+            self.save_plot(plt, file_name, as_pdf, method_name, "Routing diagnostic charts were saved at")
+        if show_plot:
+            plt.show()
+        plt.close()
+
+
+    def plot_expert_usage_layerwise(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                    as_pdf=False, file_name="expert_usage_layer"):
+        """
+        MoE metrics. Plot per-layer expert hard/soft utilization over epochs.
+        Plots can be saved as checkpoint_dir/file_name. Saves one figure per MoE layer.
+        """
+        method_name= "plot_expert_usage_layerwise"
+
+        layer_epoch= []
+        if self.expert_traker is not None:
+            layer_epoch= self.expert_traker.history["layer_epoch"]
+
+        if len(layer_epoch) == 0:
+            info_message= "No layerwise expert usage history available to plot."
+            self._log.info(f"{method_name} | {info_message}")
+            if self.verbose:
+                print(f"[INFO] {info_message}")
+            return
+
+        for layer_id, layer_hist in layer_epoch.items():
+            hard_hist= layer_hist["hard_fraction"]
+            soft_hist= layer_hist["soft_fraction"]
+
+            if len(hard_hist) == 0 or len(soft_hist) == 0:
+                continue
+
+            hard_hist= torch.stack(hard_hist).cpu()   # [n_epochs, E]
+            soft_hist= torch.stack(soft_hist).cpu()   # [n_epochs, E]
+
+            epochs= list(range(1, hard_hist.size(0) + 1))
+            if cut_first_epoch and len(epochs) > 1:
+                epochs= epochs[1:]
+                hard_hist= hard_hist[1:]
+                soft_hist= soft_hist[1:]
+
+            plt.figure(figsize=(14, 5))
+            plt.subplot(1, 2, 1)
+            for expert_id in range(hard_hist.size(1)):
+                plt.plot(
+                    epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
+                    label=f"Expert {expert_id}"
+                )
+            plt.title(f"Layer {layer_id} Hard Utilization")
+            plt.xlabel("Epochs")
+            plt.ylabel("Hard Fraction")
+            plt.legend(ncol=2 if hard_hist.size(1) > 6 else 1, fontsize=9)
+            plt.grid(True, linestyle="--", alpha=0.7)
+
+            plt.subplot(1, 2, 2)
+            for expert_id in range(soft_hist.size(1)):
+                plt.plot(
+                    epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
+                    label=f"Expert {expert_id}"
+                )
+            plt.title(f"Layer {layer_id} Soft Importance")
+            plt.xlabel("Epochs")
+            plt.ylabel("Soft Fraction")
+            plt.legend(ncol=2 if soft_hist.size(1) > 6 else 1, fontsize=9)
+            plt.grid(True, linestyle="--", alpha=0.7)
+
+            if save_charts:
+                file_name_curr= f"{file_name}_{layer_id}"
+                info_message  = f"Layer {layer_id} expert usage chart was saved at"
+                self.save_plot(plt, file_name_curr, as_pdf, method_name, info_message)
+            if show_plot:
+                plt.show()
+            plt.close()
+
+
+    def plot_expert_usage_heatmap(self, kind="hard", show_plot=True, save_charts=False, as_pdf=False,
+                                  file_name="expert_usage_heatmap"):
+        """
+        MoE metrics. Plot a heatmap of global expert usage over epochs.
+        - kind: 'hard' or 'soft'
+        Plots can be saved as checkpoint_dir/file_name.
+        """
+        method_name= "plot_expert_usage_heatmap"
+
+        hist= []
+        title= ""
+        if self.expert_traker is not None:
+            if kind == "hard":
+                hist = self.expert_traker.history["epoch_hard_fraction"]
+                title= "Global Expert Hard Utilization Heatmap"
+            elif kind == "soft":
+                hist = self.expert_traker.history["epoch_soft_fraction"]
+                title= "Global Expert Soft Importance Heatmap"
+            else:
+                raise ValueError("kind must be 'hard' or 'soft'")
+
+        if len(hist) == 0:
+            info_message= "No expert usage history available to plot."
+            self._log.info(f"{method_name} | {info_message}")
+            if self.verbose:
+                print(f"[INFO] {info_message}")
+            return
+
+        mat= torch.stack(hist).cpu().numpy().transpose()  # [E, n_epochs]
+        plt.figure(figsize=(10, 6))
+        plt.imshow(mat, aspect="auto", interpolation="nearest")
+        plt.colorbar(label=f"{kind.capitalize()} Fraction")
+        plt.title(title)
+        plt.xlabel("Expert ID")
+        plt.ylabel("Epoch")
+
+        if save_charts:
+            file_name= f"{file_name}_{kind}"
+            self.save_plot(plt, file_name, as_pdf, method_name, "Heatmap was saved at")
         if show_plot:
             plt.show()
         plt.close()
