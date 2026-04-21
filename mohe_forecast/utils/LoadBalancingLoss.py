@@ -31,65 +31,145 @@ class LoadBalancingLoss:
         return f"alpha={self.alpha}"
 
 
-    def __call__(self, gate_logits, padding_mask=None):
+    @staticmethod
+    def flatten_logits(gate_logits):
+        """
+        Concatenate all MoE layer logits into shape [n_moe_layers * B * T, E].
+        """
+        if gate_logits is None or not isinstance(gate_logits, (tuple, list)):
+            return None
+
+        valid= [x for x in gate_logits if x is not None]
+        if len(valid) == 0:
+            return None
+
+        flattened= []
+        for x in valid:
+            if x.ndim == 2:         # [N, E]
+                flattened.append(x)
+            elif x.ndim == 3:       # [B, T, E]
+                flattened.append(x.reshape(-1, x.size(-1)))
+            else:
+                raise ValueError(f"Expected logits with shape [N,E] or [B,T,E], got {tuple(x.shape)}")
+
+        return torch.cat(flattened, dim=0)  # [n_moe_layers * B * T, E]
+
+
+    @staticmethod
+    def compute_metrics(num_tokens, expert_mask, routing_weights, device):
+        """
+        Compute detached monitoring metrics from gate logits.
+        """
+        # hard load: fraction of selected slots assigned to each expert
+        token_counts= expert_mask.sum(dim=(0, 1))  # [E]
+        hard_fraction= token_counts / token_counts.sum().clamp_min(1.0)  # [E]
+        # soft importance: average routing probability mass
+        prob_mass= routing_weights.sum(dim=0)  # [E]
+        soft_fraction= prob_mass / prob_mass.sum().clamp_min(1e-12)  # [E]
+        # mean token entropy of router distribution
+        entropy= -(routing_weights * torch.log(routing_weights.clamp_min(1e-12))).sum(dim=-1).mean()
+        # collapse indicators
+        dead_experts= (token_counts == 0).sum()
+        # coefficient of variation: std / mean
+        cv_hard= hard_fraction.std(unbiased=False) / hard_fraction.mean().clamp_min(1e-12)
+        cv_soft= soft_fraction.std(unbiased=False) / soft_fraction.mean().clamp_min(1e-12)
+
+        return {
+            "hard_fraction": hard_fraction.detach(),
+            "soft_fraction": soft_fraction.detach(),
+            "token_counts": token_counts.detach(),
+            "prob_mass": prob_mass.detach(),
+            "entropy": entropy.detach(),
+            "dead_experts": dead_experts.detach(),
+            "cv_hard": cv_hard.detach(),
+            "cv_soft": cv_soft.detach(),
+            "num_tokens": torch.tensor(num_tokens, device=device),
+        }
+
+
+    def compute_layerwise_metrics(self, gate_logits, device):
+        layer_metrics= {}
+        for layer_id, logits in enumerate(gate_logits):
+            if logits is None:
+                continue
+
+            if logits.ndim == 3:
+                logits= logits.reshape(-1, logits.size(-1))  # [N, E]
+            elif logits.ndim != 2:
+                raise ValueError(f"Expected logits with shape [B,T,E] or [N,E], got {tuple(logits.shape)}")
+
+            routing_weights= F.softmax(logits, dim=-1)
+            N= routing_weights.size(0)
+            _, selected_experts= torch.topk(routing_weights, self.top_k, dim=-1)
+            expert_mask= F.one_hot(selected_experts, num_classes=self.n_experts).float()
+
+            layer_metrics[layer_id]= self.compute_metrics(N, expert_mask, routing_weights, device)
+
+        return layer_metrics
+
+
+    def __call__(self, gate_logits, padding_mask=None, return_metrics=False):
         """
         - padding_mask: a tensor of shape [batch_size, seq_len] normally passed into the model to
         indicate which token positions are "real" versus which are just padding (data-validity mask).
         """
-        if gate_logits is None or not isinstance(gate_logits, (tuple, list)) or gate_logits[0] is None:
-            return torch.zeros([])
+        concatenated_gate_logits= self.flatten_logits(gate_logits)
+        if concatenated_gate_logits is None:
+            return torch.zeros([]), None, None
 
-        device= gate_logits[0].device
-        concatenated_gate_logits= torch.cat(
-            [layer_gate.to(device) for layer_gate in gate_logits], dim=0
-        )  # shape [n_moe_layers * B * T, n_experts]
-
-        routing_weights= F.softmax(concatenated_gate_logits, dim=-1)
-        _, selected_experts= torch.topk(routing_weights, self.top_k, dim=-1)
-        expert_mask= F.one_hot(selected_experts, num_classes=self.n_experts)
+        device= concatenated_gate_logits.device
+        routing_weights= F.softmax(concatenated_gate_logits, dim=-1)  # [N, E]
+        _, selected_experts= torch.topk(routing_weights, self.top_k, dim=-1)  # [N, K]
+        expert_mask= F.one_hot(selected_experts, num_classes=self.n_experts).float()  # [N, K, E]
 
         if padding_mask is None:
-            # Compute the percentage of tokens routed to each expert
-            tokens_per_expert= torch.mean(expert_mask.float(), dim=0)
-            # Compute the average probability of routing to these experts
-            router_prob_per_expert= torch.mean(routing_weights, dim=0)
+            # compute the percentage of tokens routed to each expert (hard load)
+            tokens_per_expert= expert_mask.sum(dim=(0, 1))
+            tokens_per_expert= tokens_per_expert / tokens_per_expert.sum().clamp_min(1.0)
+            # compute the average probability of routing to these experts (soft importance)
+            router_prob_per_expert= routing_weights.mean(dim=0)
         else:
             # checking elementwise that each entry is 0 or 1
             is_binary= torch.logical_or(padding_mask == 0, padding_mask == 1)
             # ensure every position is True
             assert is_binary.all(), "padding_mask must contain only 0s and 1s"
-
             batch_size, seq_len= padding_mask.shape
+            assert concatenated_gate_logits.shape[0] % (batch_size * seq_len) == 0, \
+                "Cannot infer n_moe_layers: concatenated logits size is not divisible by B*T"
+
             # recover how many MoE layers contributed gating logits -> (n_moe_layers * B * T) // (B * T)
             n_moe_layers= concatenated_gate_logits.shape[0] // (batch_size * seq_len)
-            # Align the padding mask with the expert_mask, which has shape [n_experts, K, B * T]
-            # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-            expert_padding_mask= (
-                padding_mask[None, :, :, None, None]  # [B, T] -> [1, B, T, 1, 1]
-                .expand((n_moe_layers, batch_size, seq_len, 2, self.n_experts))
-                .reshape(-1, 2, self.n_experts)
-                .to(device)
-            )
-            # expert_attention_mask ends up with shape [n_moe_layers * B * T, K, n_experts]
+            # align the padding mask with the expert_mask, which has shape [N, K, E]
+            # compute the percentage of tokens routed to each expert
+            token_mask= (
+                padding_mask[None, :, :]
+                .expand(n_moe_layers, batch_size, seq_len)
+                .reshape(-1).to(device).float()
+            )  # [N]
+            slot_mask= token_mask[:, None, None]  # [N,1,1]
+            token_counts= (expert_mask * slot_mask).sum(dim=(0, 1))   # [E]
+            tokens_per_expert= token_counts / token_counts.sum().clamp_min(1.0)
 
-            # Compute the percentage of tokens routed to each experts
-            tokens_per_expert= torch.sum(expert_mask.float() * expert_padding_mask, dim=0) / torch.sum(
-                expert_padding_mask, dim=0
-            )
-            # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+            # compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
             router_per_expert_padding_mask= (
                 padding_mask[None, :, :, None]  # [B, T] -> [1, B, T, 1]
                 .expand((n_moe_layers, batch_size, seq_len, self.n_experts))
-                .reshape(-1, self.n_experts)
-                .to(device)
+                .reshape(-1, self.n_experts).to(device)
             )
             # router_per_expert_padding_mask shape [n_moe_layers * B * T, n_experts]
 
-            # Compute the average probability of routing to these experts
+            # compute the average probability of routing to these experts
             router_prob_per_expert= torch.sum(routing_weights * router_per_expert_padding_mask, dim=0) / torch.sum(
                 router_per_expert_padding_mask, dim=0
             )
 
-        overall_loss= torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(dim=0))
+        overall_loss= torch.sum(tokens_per_expert * router_prob_per_expert)
+        loss= self.alpha * self.n_experts * overall_loss
 
-        return self.alpha * self.n_experts * overall_loss
+        if not return_metrics:
+            return loss, None, None
+
+        global_metrics= self.compute_metrics(routing_weights.size(0), expert_mask, routing_weights, device)
+        layer_metrics = self.compute_layerwise_metrics(gate_logits, device)
+
+        return loss, global_metrics, layer_metrics

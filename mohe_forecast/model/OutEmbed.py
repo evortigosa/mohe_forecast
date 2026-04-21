@@ -145,7 +145,7 @@ class UnPatch(nn.Module):
     def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False) -> None:
         super(UnPatch, self).__init__()
         assert d_model % 4 == 0, "d_model must be divisible by 4"
-        self.channels = channels
+        self.channels= channels
         hidden_dim= round_channels(d_model // 4)
         out_channels= 1
         # calculate kernel_size and padding of the depthwise conv based on patch_width
@@ -289,7 +289,7 @@ class EncoderSSLHead(nn.Module):
     def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
                  mask_type='mae', head_type='mlp', bias=False, fine_tune=False, unpatch='conv') -> None:
         super(EncoderSSLHead, self).__init__()
-        # encoder under SSL pre-training mode
+        # MAE head (encoder side) under SSL pre-training mode
         if mask_type == 'mae':
             self.e_head= nn.Identity()
         else:
@@ -320,12 +320,16 @@ class EncoderHead(nn.Module):
     """
 
     def __init__(self, forecasting, patch_width, n_patches, channels, d_model, d_ff, n_outputs,
-                 dropout=0.2, head_type='mlp', bias=False, fine_tune=False, unpatch='conv') -> None:
+                 dropout=0.2, mask_type='mae', head_type='mlp', bias=False, fine_tune=False,
+                 unpatch='conv') -> None:
         super(EncoderHead, self).__init__()
         self.forecasting= forecasting
-        self.channels= channels
+        self.mask_type= mask_type
 
-        if forecasting:
+        # MAE head (decoder side) under SSL pre-training mode
+        if mask_type == 'mae':
+            self.e_head= nn.Linear(d_model, patch_width, bias=bias)  # embedding to patch
+        elif forecasting:
             # encoder forecasting head
             self.e_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
             if unpatch == 'linear':
@@ -340,6 +344,9 @@ class EncoderHead(nn.Module):
 
 
     def forward(self, x):
+        if self.mask_type == 'mae':
+            return self.e_head(x)
+
         if self.forecasting:
             x= self.e_head(x)
             return self.unpatch(x)

@@ -46,12 +46,12 @@ class TSFTransformer(nn.Module):
 
     def __init__(
         self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
-        is_causal=False, forecasting=True, mask_ratio=0., mask_type='mae', n_layer=6, d_model=256, block_size=672,
+        is_causal=False, forecasting=True, mask_ratio=0., mask_type='random', n_layer=6, d_model=256, block_size=672,
         n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
         diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
         output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
         use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False,
-        cls_token=False
+        cls_token=False, c_att_mode='full'
     ) -> None:
         super(TSFTransformer, self).__init__()
         assert patch_width > 0, "patch_width must be greater than zero"
@@ -70,6 +70,7 @@ class TSFTransformer(nn.Module):
         output_head_type= output_head_type.lower()
         unpatch= unpatch.lower()
         emb_norm_type= emb_norm_type.lower() if isinstance(emb_norm_type, str) else emb_norm_type
+        c_att_mode= c_att_mode.lower()
 
         self.n_outputs= int(n_outputs)
         self.is_causal= is_causal
@@ -133,7 +134,7 @@ class TSFTransformer(nn.Module):
         self.backbone= TransformerModel(
             multi_modal, is_causal, n_layer, d_model, patch_dim, n_heads, n_kv_heads, d_ff, dropout,
             drop_path, norm_type, flash_attn, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-            experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate
+            experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
         )
 
         patch_dim= patch_dim - 1 if cls_token else patch_dim
@@ -156,7 +157,7 @@ class TSFTransformer(nn.Module):
                 out_dim= self.block_size if self.forecasting else self.n_outputs
                 self.head= EncoderHead(
                     self.forecasting, self.patch_width, patch_dim, channels, d_model, d_ff, out_dim,
-                    output_head_dropout, output_head_type, bias, fine_tune, unpatch
+                    output_head_dropout, mask_type, output_head_type, bias, fine_tune, unpatch
                 )
         self.set_horizon(self.forecast_lst)
 
@@ -166,7 +167,7 @@ class TSFTransformer(nn.Module):
             n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, flash_attn, diff_attn,
             ffn_type, glu, n_experts, top_k_experts, experts_type, output_head_type, fine_tune,
             unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout, use_qk_norm,
-            headwise_attn_gate, cls_token
+            headwise_attn_gate, cls_token, c_att_mode
         )
 
 
@@ -181,24 +182,26 @@ class TSFTransformer(nn.Module):
         return cls(**filtered)
 
 
-    def disable_ssl_mode(self, head):
+    def disable_ssl_mode(self, head, width_factor:float):
         assert not self.is_causal, "SSL mode is only available for Encoder-only models"
         assert isinstance(head, EncoderHead), "Head must be an EncoderHead for disabling SSL mode"
         self.mask_layer= None
         self.head= head
         self.forecasting= self.head.forecasting
+        self.width_factor= width_factor
+        self.set_horizon()
 
         return "SSL mode disabled"
 
 
-    def enable_ssl_mode(self, head, mask_ratio=0.2):
+    def enable_ssl_mode(self, head, mask_ratio=0.7):
         assert not self.is_causal, "SSL mode is only available for Encoder-only models"
         assert isinstance(head, EncoderSSLHead), "Head must be an EncoderSSLHead for enabling SSL mode"
         self.mask_layer= PatchMasking(mask_ratio)
         self.head= head
         self.forecasting= False
 
-        return f"SSL mode enabled with mask_ratio={mask_ratio}"
+        return f"SSL mode enabled with random mask and mask_ratio={mask_ratio}"
 
 
     def switch_model_type(self, head, flash_attn=None):

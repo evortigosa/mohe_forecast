@@ -314,9 +314,9 @@ class KVCache:
     """
 
     def __init__(self, block_size, n_kv_heads, d_head) -> None:
-        self.block_size= block_size
-        self.n_heads= n_kv_heads
-        self.d_head = d_head
+        self.block_size= int(block_size)
+        self.n_heads= int(n_kv_heads)
+        self.d_head = int(d_head)
         self.cache_len= 0
         # None until init_cache is called
         self.k_cache= None
@@ -702,7 +702,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6,
                  d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
                  ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False) -> None:
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False,
+                 c_att_mode='full') -> None:
         super(TransformerBlock, self).__init__()
 
         # Self-Attention module to endogenous series
@@ -714,7 +715,7 @@ class TransformerBlock(nn.Module):
         self.drop_path1= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         # Cross-Attention module to incorporate exogenous covariates
-        if multi_modal:
+        if multi_modal and (c_att_mode=='full' or (c_att_mode=='first' and depth==0)):
             self.norm2= self.get_norm(norm_type, d_model, init_alpha=0.6)
             self.c_att= MultiHeadedAttention(
                 depth, d_model, block_size, n_heads, n_kv_heads, dropout, False, bias, rope_theta,
@@ -777,12 +778,11 @@ class TransformerModel(nn.Module):
     can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     """
 
-    def __init__(
-        self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
-        n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
-        diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2,
-        experts_type='fan', bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False
-    ) -> None:
+    def __init__(self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
+                 n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
+                 diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2,
+                 experts_type='fan', bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False,
+                 c_att_mode='full') -> None:
         super(TransformerModel, self).__init__()
         # block_size represents the max sequence length
         self.block_size= block_size
@@ -804,7 +804,7 @@ class TransformerModel(nn.Module):
             TransformerBlock(
                 multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout,
                 sdp_rates[depth], norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-                experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate
+                experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
             ) for depth in range(n_layer)
         ])
         # final normalization layer after the last TransformerBlock

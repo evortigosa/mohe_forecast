@@ -19,7 +19,7 @@ class BaseConfig:
     - is_causal (bool): Default is False. Encoder Transformer (False) or Decoder Transformer (True).
     - forecasting (bool): Default is True. Defines the model as a forecaster.
     - mask_ratio (float): Default is 0. Enables representation learning.
-    - mask_type (str): Default is 'mae' for a MAE-style masking. This can be 'mae' or 'random'.
+    - mask_type (str): Default is 'random' for patch masking. This can be 'mae' for MAE-style masking.
     - n_layer (int): Default is 6. Defines the number of transformer layers/blocks.
     - d_model (int): Default is 256. Defines the model dimension.
     - block_size (int): Default is 672. Defines the max size of the look-back window.
@@ -47,6 +47,7 @@ class BaseConfig:
     - use_qk_norm (bool): Default is False. Enables the QK functional RMSNorm after RoPE.
     - headwise_attn_gate (bool): Default is False. Enables headwise attention gate.
     - cls_token (bool): Default is False. Enables an extra classification token.
+    - c_att_mode (str): Default is 'full'. Cross Attn (multi_modal) across the model. Can be 'full' or 'first'.
     """
     patch_width:int= 16
     channels:int= 1
@@ -56,7 +57,7 @@ class BaseConfig:
     is_causal:bool= False          # Encoder Transformer (False) or Decoder Transformer (True)
     forecasting:bool= True
     mask_ratio:float= 0.           # enables representation learning
-    mask_type:str= 'mae'           # mae, random
+    mask_type:str= 'random'        # mae, random
     n_layer:int= 6
     d_model:int= 256
     block_size:int= 672
@@ -84,6 +85,7 @@ class BaseConfig:
     use_qk_norm:bool= False
     headwise_attn_gate:bool= False
     cls_token:bool= False
+    c_att_mode:str= 'full'         # full, first
 
 
 @dataclass
