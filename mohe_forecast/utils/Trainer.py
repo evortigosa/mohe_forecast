@@ -292,6 +292,9 @@ class Trainer:
         """
         Train the model for a specified number of epochs, performing validation and checkpointing.
         """
+        self._log.info(f"train | use_bf16={use_bf16}, clip_grad={clip_grad}, get_moe_metrics={get_moe_metrics}")
+        self._log.info(f"train | Model full config: {self.model.config}")
+
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
