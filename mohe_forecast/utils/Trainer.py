@@ -466,17 +466,21 @@ class Trainer:
         checkpoint= {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
             'config': asdict(self.model.config),
+            'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': best_val_loss,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'lr_hist': self.lr_hist,
-            'expert_traker': self.expert_traker.state_dict() if self.expert_traker is not None else None,
             'timestamp': time.time(),
         }
         try:
             torch.save(checkpoint, checkpoint_path)
+            # (optional) save full expert tracker history in a separate file
+            if self.expert_traker is not None:
+                traker_path= self.get_checkpoint_path(f'{self.filename}_expert_traker.pt', self.checkpoint_dir)
+                torch.save(self.expert_traker.state_dict(), traker_path)
+
             self._log.info(
                 "save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s",
                 epoch + 1, best_val_loss, checkpoint_path
@@ -543,10 +547,22 @@ class Trainer:
                 self.val_losses= checkpoint.get('val_losses', [])
                 self.lr_hist= checkpoint.get('lr_hist', [])
                 self.expert_traker= None
+                # load (optional) expert tracker history from a separate file
+                traker_path= f'{checkpoint_path[:-4]}_expert_traker.pt'
+                # load (optional) expert tracker history from the checkpoint file (old)
                 tracker= checkpoint.get('expert_traker', None)
-                if tracker is not None:
+
+                if os.path.exists(traker_path) or tracker is not None:
+                    if os.path.exists(traker_path):
+                        tracker= torch.load(traker_path, map_location="cpu")
                     self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
                     self.expert_traker.load_state_dict(tracker)
+                else:
+                    self._log.warning(
+                        "load_checkpoint | No MoE usage history to load: skipping expert_traker restore."
+                    )
+                    if self.verbose:
+                        print("[WARNING] No MoE usage history to load: skipping expert_traker restore.")
 
             self._log.info(
                 "load_checkpoint | Checkpoint loaded from '%s'. Resuming training with best validation loss of %.4f.",
