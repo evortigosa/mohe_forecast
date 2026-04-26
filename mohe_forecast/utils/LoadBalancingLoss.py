@@ -28,7 +28,7 @@ class LoadBalancingLoss:
 
 
     def extra_repr(self):
-        return f"alpha={self.alpha}"
+        return f"n_experts={self.n_experts}, top_k={self.top_k}, alpha={self.alpha}"
 
 
     @staticmethod
@@ -56,10 +56,12 @@ class LoadBalancingLoss:
 
 
     @staticmethod
-    def compute_metrics(num_tokens, expert_mask, routing_weights, device):
+    def compute_metrics(expert_mask, routing_weights, device):
         """
         Compute detached monitoring metrics from gate logits.
+        TODO: get metrics when padding_mask is not None
         """
+        num_tokens= routing_weights.size(0)
         # hard load: fraction of selected slots assigned to each expert
         token_counts= expert_mask.sum(dim=(0, 1))  # [E]
         hard_fraction= token_counts / token_counts.sum().clamp_min(1.0)  # [E]
@@ -99,11 +101,10 @@ class LoadBalancingLoss:
                 raise ValueError(f"Expected logits with shape [B,T,E] or [N,E], got {tuple(logits.shape)}")
 
             routing_weights= F.softmax(logits, dim=-1)
-            N= routing_weights.size(0)
             _, selected_experts= torch.topk(routing_weights, self.top_k, dim=-1)
             expert_mask= F.one_hot(selected_experts, num_classes=self.n_experts).float()
 
-            layer_metrics[layer_id]= self.compute_metrics(N, expert_mask, routing_weights, device)
+            layer_metrics[layer_id]= self.compute_metrics(expert_mask, routing_weights, device)
 
         return layer_metrics
 
@@ -169,7 +170,7 @@ class LoadBalancingLoss:
         if not return_metrics:
             return loss, None, None
 
-        global_metrics= self.compute_metrics(routing_weights.size(0), expert_mask, routing_weights, device)
+        global_metrics= self.compute_metrics(expert_mask, routing_weights, device)
         layer_metrics = self.compute_layerwise_metrics(gate_logits, device)
 
         return loss, global_metrics, layer_metrics
