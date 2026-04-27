@@ -6,22 +6,37 @@ Time Series Data Augmentation Module
 
 import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 
 
-class TSAugmentation(nn.Module):
+class TSAugmentation:
     """
     --- WIP ---
     Time series augmentation module for multivariate data.
+    - augment_channels is a list of channel indices to augment, i.e., keep the remaining channels
+    unchanged. Do not apply augmentation in (blindly) channels with:
+    - continuous target variables
+    - observed covariates
+    - calendar/time covariates
+    - binary indicators
+    - missingness masks
+    - static identifiers
+    For multivariate forecasting:
+    - jitter: yes, mild, after normalization
+    - magnitude warp: yes, mild, only for continuous channels
+    - time warp: optional, use carefully
+    - calendar/time covariates: never augment
+    - target consistency: augment full context+future before splitting, or use weak input-side noise
+    to avoid creating artificial pairs where the input dynamics no longer match the future target dynamics.
     """
 
     def __init__(self, channels, max_epochs, jitter_sigma=0.02, jitter_prob=0.5, warp_strength=0.1,
-                 warp_prob=0.3, mag_sigma=0.02, mag_prob=0.3) -> None:
-        super(TSAugmentation, self).__init__()
+                 warp_prob=0.3, mag_sigma=0.02, mag_prob=0.3, augment_channels=None, layout="auto") -> None:
         self.channels= int(channels)
         self.max_epochs= int(max_epochs)
+        self.augment_channels= augment_channels
+        self.layout= layout
         # augmentation magnitudes and base probabilities
         self.jitter_sigma= jitter_sigma
         self.jitter_prob = jitter_prob
@@ -33,51 +48,76 @@ class TSAugmentation(nn.Module):
         self.epoch= 0
         # store initial values so scheduling is deterministic immediately
         self.jitter_prob_init= float(jitter_prob)
-        self.warp_prob_init= float(warp_prob)
-        self.mag_prob_init= float(mag_prob)
+        self.warp_prob_init  = float(warp_prob)
+        self.mag_prob_init   = float(mag_prob)
 
 
     def _ensure_btc(self, x):
         if x.ndim != 3:
-            raise ValueError(f"Expected 3D tensor (B,T,C) or (B,C,T); got shape {tuple(x.shape)}")
-        # if last dim equals channels: (B, T, C) -> (B, T, C)
-        if x.shape[2]== self.channels:
-            return x, False
-        # if middle dim equals channels: (B, C, T) -> (B, T, C)
-        if x.shape[1]== self.channels:
-            return x.transpose(1, 2), True
+            raise ValueError(f"Expected 3D tensor; got shape {tuple(x.shape)}")
 
-        raise ValueError(
-            f"Cannot infer channel dimension for channels={self.channels}."
-            f"x.shape = {tuple(x.shape)}"
-        )
+        if self.layout == "BTC":
+            if x.shape[2] != self.channels:
+                raise ValueError(f"Expected (B,T,C) with C={self.channels}; got {tuple(x.shape)}")
+            return x, False  # last dim equals channels: (B, T, C) -> (B, T, C)
+
+        if self.layout == "BCT":
+            if x.shape[1] != self.channels:
+                raise ValueError(f"Expected (B,C,T) with C={self.channels}; got {tuple(x.shape)}")
+            return x.transpose(1, 2), True  # middle dim equals channels: (B, C, T) -> (B, T, C)
+
+        if self.layout == "auto":
+            if x.shape[2] == self.channels and x.shape[1] == self.channels:
+                raise ValueError(
+                    f"Ambiguous shape {tuple(x.shape)}: both dim 1 and dim 2 match channels={self.channels}. "
+                    "Use layout='BTC' or layout='BCT'."
+                )
+            if x.shape[2] == self.channels:  # if last dim equals channels: (B, T, C) -> (B, T, C)
+                return x, False
+            if x.shape[1] == self.channels:  # if middle dim equals channels: (B, C, T) -> (B, T, C)
+                return x.transpose(1, 2), True
+
+        raise ValueError(f"Cannot infer layout for shape {tuple(x.shape)} and channels={self.channels}")
 
 
-    def step_epoch(self) -> None:
+    def set_epoch(self, epoch:int) -> None:
+        self.epoch= int(epoch)
+
+
+    def step_epoch(self, floor:float=0.1) -> None:
         """
         Schedule augmentation probabilities to decrease over epochs.
         """
+        assert floor >= 0., "floor must be a non-negative value"
         self.epoch += 1
-        t= min(max(self.epoch / max(1, self.max_epochs), 0.0), 1.0)  # fraction in [0,1]
-        floor= 0.1
-        self.jitter_prob= float(self.jitter_prob_init * (1.0 - t) + floor)
-        self.warp_prob= float(self.warp_prob_init * (1.0 - t) + floor)
-        self.mag_prob= float(self.mag_prob_init * (1.0 - t) + floor)
-        # safety clamp
-        self.jitter_prob= max(0.0, min(1.0, self.jitter_prob))
-        self.warp_prob= max(0.0, min(1.0, self.warp_prob))
-        self.mag_prob= max(0.0, min(1.0, self.mag_prob))
+        t= min(max(self.epoch / max(1, self.max_epochs), 0.0), 1.0)
+
+        def decay(p0):
+            p0= float(p0)
+            # avoid increasing probabilities if p0 < floor
+            local_floor= min(floor, p0)
+            p= local_floor + (p0 - local_floor) * (1.0 - t)
+            return max(0.0, min(1.0, p))
+
+        self.jitter_prob= decay(self.jitter_prob_init)
+        self.warp_prob  = decay(self.warp_prob_init)
+        self.mag_prob   = decay(self.mag_prob_init)
 
 
     def _jitter(self, x):
         """
-        Add Gaussian noise to each timestep and channel.
+        Add Gaussian noise to each timestep and channel (per-sample augmentation).
+        Best practice: standardize/normalize training data first, then apply jitter in normalized
+        space.
         https://arxiv.org/abs/1706.00527
         """
-        if torch.rand((), device=x.device).item() >= self.jitter_prob or self.jitter_sigma <= 0:
+        if self.jitter_sigma <= 0 or self.jitter_prob <= 0:
             return x
+        B= x.shape[0]
+        mask= (torch.rand(B, 1, 1, device=x.device) < self.jitter_prob).to(x.dtype)
         noise= torch.randn_like(x) * self.jitter_sigma
-        return x + noise
+
+        return x + mask * noise
 
 
     def _time_warp(self, x):
@@ -87,6 +127,9 @@ class TSAugmentation(nn.Module):
         if torch.rand((), device=x.device).item() >= self.warp_prob or self.warp_strength <= 0:
             return x
         B, T, C= x.shape
+        # compute the augmentation in FP32 and cast back at the end
+        orig_dtype= x.dtype
+        x= x.float()
         device, dtype= x.device, x.dtype
         # base time grid (for generating the warp)
         t= torch.linspace(-1.0, 1.0, steps=T, device=device, dtype=dtype)  # (T,)
@@ -101,9 +144,9 @@ class TSAugmentation(nn.Module):
         phases= phases.view(B, num_waves, 1)        # (B,num_waves,1)
         waves = torch.sin(2.0 * math.pi * freqs * t_expand + phases)  # (B, num_waves, T)
         waves_sum= waves.sum(dim=1)                 # (B, T)
-        # a positive velocity field -> ensure > 0 (softplus is smooth and > 0)
-        g= 1.0 + self.warp_strength * waves_sum     # (B, T)
-        g= F.softplus(g) + 1e-6                     # (B, T) strictly > 0
+        # a positive velocity field -> ensure > 0
+        waves_sum= waves_sum / math.sqrt(num_waves)
+        g= torch.exp(self.warp_strength * waves_sum)  # (B, T) strictly > 0
         # integrate (cumulative sum) to get strictly increasing mapping use simple cumulative sum
         cum= torch.cumsum(g, dim=1)                 # (B, T)
         # normalize cumulative to [0, 1], then to [-1, 1]
@@ -125,21 +168,24 @@ class TSAugmentation(nn.Module):
             x_reshaped, grid, mode='bilinear', padding_mode='border', align_corners=True
         )  # (B*C, 1, T, 1)
         # reshape back to (B, T, C)
-        return x_warped.view(B, C, T, 1).squeeze(-1).permute(0, 2, 1).contiguous()
+        return x_warped.view(B, C, T, 1).squeeze(-1).permute(0, 2, 1).contiguous().to(orig_dtype)
 
 
     def _magnitude_warp(self, x, knot=4):
         """
-        Apply magnitude warping by multiplying with a smooth random curve.
+        Apply magnitude warping by multiplying with a piecewise-linear random curve.
         """
         if torch.rand((), device=x.device).item() >= self.mag_prob or self.mag_sigma <= 0.0:
             return x
         B, T, C= x.shape
+        # compute the augmentation in FP32 and cast back at the end
+        orig_dtype= x.dtype
+        x= x.float()
         device, dtype= x.device, x.dtype
         K= knot + 2
         # uniformly spaced time samples in [0,1]
         t    = torch.linspace(0.0, 1.0, steps=T, device=device, dtype=dtype)    # (T,)
-        knots= 1.0 + self.mag_sigma * torch.randn((B, C, K), device=device, dtype=dtype)  # (B, C, K)
+        knots= torch.exp(self.mag_sigma * torch.randn((B, C, K), device=device, dtype=dtype))  # (B, C, K)
         # compute segment indices for each t (index into knots)
         j= torch.floor(t * (K - 1)).to(torch.long).clamp(0, K - 2)  # (T,)
         # expand to (B, C, T) for gather
@@ -154,18 +200,37 @@ class TSAugmentation(nn.Module):
         # apply curve: curve -> (B, T, C)
         curve= curve.permute(0, 2, 1).contiguous()                  # (B,T,C)
 
-        return x * curve
+        return (x * curve).to(orig_dtype)
 
 
-    def forward(self, x):
+    def __call__(self, x, jitter=True, time_warp=True, magnitude_warp=True):
         """
         Apply augmentations to input time series.
         """
         x, transposed= self._ensure_btc(x)
-        x= self._jitter(x)
-        x= self._time_warp(x)
-        x= self._magnitude_warp(x)
+
+        if self.augment_channels is not None:
+            out= x.clone()
+            xa = x[:, :, self.augment_channels]
+
+            if jitter:
+                xa= self._jitter(xa)
+            if time_warp:
+                xa= self._time_warp(xa)
+            if magnitude_warp:
+                xa= self._magnitude_warp(xa)
+
+            out[:, :, self.augment_channels]= xa
+            x= out
+        else:
+            if jitter:
+                x= self._jitter(x)
+            if time_warp:
+                x= self._time_warp(x)
+            if magnitude_warp:
+                x= self._magnitude_warp(x)
+
         if transposed:
-            x= x.transpose(1, 2)  # back to (B, C, T)
+            x= x.transpose(1, 2)
 
         return x.contiguous()
