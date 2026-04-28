@@ -722,36 +722,47 @@ class Trainer:
             hard_hist= hard_hist[1:]
             soft_hist= soft_hist[1:]
 
-        plt.figure(figsize=(14, 5))
-        plt.subplot(1, 2, 1)
-        for expert_id in range(hard_hist.size(1)):
-            plt.plot(
+        n_experts= hard_hist.size(1)
+        legend_ncol= min(n_experts, 8)
+        handles= []
+        labels = []
+        fig, axes= plt.subplots(1, 2, figsize=(14, 5))
+
+        # hard utilization
+        for expert_id in range(n_experts):
+            line,= axes[0].plot(
                 epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
                 label=f"Expert {expert_id}"
             )
-        plt.title("Global Expert Hard Utilization")
-        plt.xlabel("Epochs")
-        plt.ylabel("Hard Fraction")
-        plt.legend(ncol=2 if hard_hist.size(1) > 6 else 1, fontsize=9)
-        plt.grid(True, linestyle="--", alpha=0.7)
+            handles.append(line)
+            labels.append(f"Expert {expert_id}")
+        axes[0].set_title("Global Expert Hard Utilization")
+        axes[0].set_xlabel("Epochs")
+        axes[0].set_ylabel("Hard Fraction")
+        axes[0].grid(True, linestyle="--", alpha=0.7)
 
-        plt.subplot(1, 2, 2)
-        for expert_id in range(soft_hist.size(1)):
-            plt.plot(
+        # soft importance
+        for expert_id in range(n_experts):
+            axes[1].plot(
                 epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
                 label=f"Expert {expert_id}"
             )
-        plt.title("Global Expert Soft Importance")
-        plt.xlabel("Epochs")
-        plt.ylabel("Soft Fraction")
-        plt.legend(ncol=2 if soft_hist.size(1) > 6 else 1, fontsize=9)
-        plt.grid(True, linestyle="--", alpha=0.7)
+        axes[1].set_title("Global Expert Soft Importance")
+        axes[1].set_xlabel("Epochs")
+        axes[1].set_ylabel("Soft Fraction")
+        axes[1].grid(True, linestyle="--", alpha=0.7)
+
+        fig.legend(
+            handles, labels, loc="lower center", fancybox=True, ncol=legend_ncol, frameon=True,
+            bbox_to_anchor=(0.5, -0.04), fontsize=9
+        )
+        fig.tight_layout(rect=(0, 0.03, 1, 0.95))
 
         if save_charts:
-            self.save_plot(plt, file_name, as_pdf, method_name, "Expert usage charts were saved at")
+            self.save_plot(fig, file_name, as_pdf, method_name, "Expert usage charts were saved at")
         if show_plot:
             plt.show()
-        plt.close()
+        plt.close(fig)
 
 
     def plot_expert_routing_diagnostics(self, cut_first_epoch=False, show_plot=True, save_charts=False,
@@ -845,38 +856,49 @@ class Trainer:
                 hard_hist= hard_hist[1:]
                 soft_hist= soft_hist[1:]
 
-            plt.figure(figsize=(14, 5))
-            plt.subplot(1, 2, 1)
-            for expert_id in range(hard_hist.size(1)):
-                plt.plot(
+            n_experts= hard_hist.size(1)
+            legend_ncol= min(n_experts, 8)
+            handles= []
+            labels = []
+            fig, axes= plt.subplots(1, 2, figsize=(14, 5))
+
+            # hard utilization
+            for expert_id in range(n_experts):
+                line,= axes[0].plot(
                     epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
                     label=f"Expert {expert_id}"
                 )
-            plt.title(f"Layer {layer_id} Hard Utilization")
-            plt.xlabel("Epochs")
-            plt.ylabel("Hard Fraction")
-            plt.legend(ncol=2 if hard_hist.size(1) > 6 else 1, fontsize=9)
-            plt.grid(True, linestyle="--", alpha=0.7)
+                handles.append(line)
+                labels.append(f"Expert {expert_id}")
+            axes[0].set_title(f"Layer {layer_id} Hard Utilization")
+            axes[0].set_xlabel("Epochs")
+            axes[0].set_ylabel("Hard Fraction")
+            axes[0].grid(True, linestyle="--", alpha=0.7)
 
-            plt.subplot(1, 2, 2)
-            for expert_id in range(soft_hist.size(1)):
-                plt.plot(
+            # soft importance
+            for expert_id in range(n_experts):
+                axes[1].plot(
                     epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
                     label=f"Expert {expert_id}"
                 )
-            plt.title(f"Layer {layer_id} Soft Importance")
-            plt.xlabel("Epochs")
-            plt.ylabel("Soft Fraction")
-            plt.legend(ncol=2 if soft_hist.size(1) > 6 else 1, fontsize=9)
-            plt.grid(True, linestyle="--", alpha=0.7)
+            axes[1].set_title(f"Layer {layer_id} Soft Importance")
+            axes[1].set_xlabel("Epochs")
+            axes[1].set_ylabel("Soft Fraction")
+            axes[1].grid(True, linestyle="--", alpha=0.7)
+
+            fig.legend(
+                handles, labels, loc="lower center", fancybox=True, ncol=legend_ncol, frameon=True,
+                bbox_to_anchor=(0.5, -0.04), fontsize=9
+            )
+            fig.tight_layout(rect=(0, 0.03, 1, 0.95))
 
             if save_charts:
                 file_name_curr= f"{file_name}_{layer_id}"
                 info_message  = f"Layer {layer_id} expert usage chart was saved at"
-                self.save_plot(plt, file_name_curr, as_pdf, method_name, info_message)
+                self.save_plot(fig, file_name_curr, as_pdf, method_name, info_message)
             if show_plot:
                 plt.show()
-            plt.close()
+            plt.close(fig)
 
 
     def plot_expert_usage_heatmap(self, kind="hard", show_plot=True, save_charts=False, as_pdf=False,
