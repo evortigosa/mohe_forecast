@@ -894,12 +894,12 @@ class Trainer:
     @staticmethod
     def _set_expert_usage_heatmap(hard_hist, soft_hist, cut_first_epoch:bool, layer_id=None):
 
-        def set_sparse_epoch_ticks(ax, n_epochs, max_ticks=10):
+        def set_sparse_epoch_ticks(ax, num_epochs, max_ticks=10):
             """
             helper to avoid crowded x ticks.
             """
-            step= max(1, int(np.ceil(n_epochs / max_ticks)))
-            ticks= list(range(0, n_epochs, step))
+            step= max(1, int(np.ceil(num_epochs / max_ticks)))
+            ticks= list(range(0, num_epochs, step))
             labels= [str(t + 1) for t in ticks]
             ax.set_xticks(ticks)
             ax.set_xticklabels(labels)
