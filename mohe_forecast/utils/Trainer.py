@@ -311,6 +311,9 @@ class Trainer:
             if self.expert_traker is not None:
                 self.expert_traker.reset_epoch()
 
+            if self.augmentation is not None:
+                self.augmentation.set_epoch(epoch)
+
             if use_bf16:
                 train_loss, epoch_lr= self.train_one_epoch_bf16(epoch+1, clip_grad, get_moe_metrics)
             else:
@@ -624,12 +627,13 @@ class Trainer:
             raise e
 
 
-    def save_plot(self, plt_obj, file_name, as_pdf, method_name, info_message) -> None:
+    def save_plot(self, plt_obj, file_name, as_pdf, method_name, info_message, tight=True) -> None:
         plots_dir= f"{self.checkpoint_dir}/plots"
         os.makedirs(plots_dir, exist_ok=True)
         save_path= self.get_checkpoint_path(file_name, plots_dir)
 
-        plt_obj.tight_layout()
+        if tight:
+            plt_obj.tight_layout()
         if as_pdf:
             save_path= f'{save_path}.pdf'
             plt_obj.savefig(save_path, dpi=300, pad_inches=0.01, bbox_inches="tight")
@@ -693,82 +697,10 @@ class Trainer:
         plt.close()
 
 
-    def plot_expert_usage_global(self, cut_first_epoch=False, show_plot=True, save_charts=False,
-                                 as_pdf=False, file_name="expert_usage_global"):
-        """
-        MoE metrics. Plot global expert hard/soft utilization over epochs.
-        Plots can be saved as checkpoint_dir/file_name.
-        """
-        method_name= "plot_expert_usage_global"
-
-        hard_hist, soft_hist= [], []
-        if self.expert_traker is not None:
-            hard_hist= self.expert_traker.history["epoch_hard_fraction"]
-            soft_hist= self.expert_traker.history["epoch_soft_fraction"]
-
-        if len(hard_hist) == 0 or len(soft_hist) == 0:
-            info_message= "No expert usage history available to plot."
-            self._log.info(f"{method_name} | {info_message}")
-            if self.verbose:
-                print(f"[INFO] {info_message}")
-            return
-
-        hard_hist= torch.stack(hard_hist).cpu()   # [n_epochs, E]
-        soft_hist= torch.stack(soft_hist).cpu()   # [n_epochs, E]
-
-        epochs= list(range(1, hard_hist.size(0) + 1))
-        if cut_first_epoch and len(epochs) > 1:
-            epochs= epochs[1:]
-            hard_hist= hard_hist[1:]
-            soft_hist= soft_hist[1:]
-
-        n_experts= hard_hist.size(1)
-        legend_ncol= min(n_experts, 8)
-        handles= []
-        labels = []
-        fig, axes= plt.subplots(1, 2, figsize=(14, 5))
-
-        # hard utilization
-        for expert_id in range(n_experts):
-            line,= axes[0].plot(
-                epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
-                label=f"Expert {expert_id}"
-            )
-            handles.append(line)
-            labels.append(f"Expert {expert_id}")
-        axes[0].set_title("Global Expert Hard Utilization")
-        axes[0].set_xlabel("Epochs")
-        axes[0].set_ylabel("Hard Fraction")
-        axes[0].grid(True, linestyle="--", alpha=0.7)
-
-        # soft importance
-        for expert_id in range(n_experts):
-            axes[1].plot(
-                epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
-                label=f"Expert {expert_id}"
-            )
-        axes[1].set_title("Global Expert Soft Importance")
-        axes[1].set_xlabel("Epochs")
-        axes[1].set_ylabel("Soft Fraction")
-        axes[1].grid(True, linestyle="--", alpha=0.7)
-
-        fig.legend(
-            handles, labels, loc="lower center", fancybox=True, ncol=legend_ncol, frameon=True,
-            bbox_to_anchor=(0.5, -0.04), fontsize=9
-        )
-        fig.tight_layout(rect=(0, 0.03, 1, 0.95))
-
-        if save_charts:
-            self.save_plot(fig, file_name, as_pdf, method_name, "Expert usage charts were saved at")
-        if show_plot:
-            plt.show()
-        plt.close(fig)
-
-
     def plot_expert_routing_diagnostics(self, cut_first_epoch=False, show_plot=True, save_charts=False,
                                         as_pdf=False, file_name="expert_routing_diagnostics"):
         """
-        MoE metrics. Plot global routing health metrics over epochs.
+        MoE metrics. Plot global routing health metrics over epochs  (entropy, dead experts, and CV).
         Plots can be saved as checkpoint_dir/file_name.
         """
         method_name= "plot_expert_routing_diagnostics"
@@ -821,13 +753,22 @@ class Trainer:
         plt.close()
 
 
-    def plot_expert_usage_layerwise(self, cut_first_epoch=False, show_plot=True, save_charts=False,
-                                    as_pdf=False, file_name="expert_usage_layer"):
-        """
-        MoE metrics. Plot per-layer expert hard/soft utilization over epochs.
-        Plots can be saved as checkpoint_dir/file_name. Saves one figure per MoE layer.
-        """
-        method_name= "plot_expert_usage_layerwise"
+    def _get_expert_hist(self, is_global:bool, method_name:str):
+
+        if is_global:
+            hard_hist, soft_hist= [], []
+            if self.expert_traker is not None:
+                hard_hist= self.expert_traker.history["epoch_hard_fraction"]
+                soft_hist= self.expert_traker.history["epoch_soft_fraction"]
+
+            if len(hard_hist) == 0 or len(soft_hist) == 0:
+                info_message= "No expert usage history available to plot."
+                self._log.info(f"{method_name} | {info_message}")
+                if self.verbose:
+                    print(f"[INFO] {info_message}")
+                return None, None
+
+            return hard_hist, soft_hist
 
         layer_epoch= []
         if self.expert_traker is not None:
@@ -838,6 +779,98 @@ class Trainer:
             self._log.info(f"{method_name} | {info_message}")
             if self.verbose:
                 print(f"[INFO] {info_message}")
+            return None
+
+        return layer_epoch
+
+
+    @staticmethod
+    def _set_expert_usage_plot(hard_hist, soft_hist, cut_first_epoch:bool, layer_id=None):
+        hard_hist= torch.stack(hard_hist).cpu()   # [n_epochs, E]
+        soft_hist= torch.stack(soft_hist).cpu()   # [n_epochs, E]
+
+        epochs= list(range(1, hard_hist.size(0) + 1))
+        if cut_first_epoch and len(epochs) > 1:
+            epochs= epochs[1:]
+            hard_hist= hard_hist[1:]
+            soft_hist= soft_hist[1:]
+
+        n_experts= hard_hist.size(1)
+        legend_ncol= min(n_experts, 8)
+        handles= []
+        labels = []
+        fig, axes= plt.subplots(1, 2, figsize=(14, 5))
+
+        # hard utilization
+        for expert_id in range(n_experts):
+            line,= axes[0].plot(
+                epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
+                label=f"Expert {expert_id}"
+            )
+            handles.append(line)
+            labels.append(f"Expert {expert_id}")
+        if layer_id is None:
+            axes[0].set_title("Global Expert Hard Utilization")
+        else:
+            axes[0].set_title(f"Layer {layer_id} Hard Utilization")
+        axes[0].set_xlabel("Epochs")
+        axes[0].set_ylabel("Hard Fraction")
+        axes[0].grid(True, linestyle="--", alpha=0.7)
+
+        # soft importance
+        for expert_id in range(n_experts):
+            axes[1].plot(
+                epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
+                label=f"Expert {expert_id}"
+            )
+        if layer_id is None:
+            axes[1].set_title("Global Expert Soft Importance")
+        else:
+            axes[1].set_title(f"Layer {layer_id} Soft Importance")
+        axes[1].set_xlabel("Epochs")
+        axes[1].set_ylabel("Soft Fraction")
+        axes[1].grid(True, linestyle="--", alpha=0.7)
+
+        fig.legend(
+            handles, labels, loc="lower center", fancybox=True, ncol=legend_ncol, frameon=True,
+            bbox_to_anchor=(0.5, -0.04), fontsize=9
+        )
+        fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+
+        return fig, axes
+
+
+    def plot_expert_usage_global(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                 as_pdf=False, file_name="expert_usage_global"):
+        """
+        MoE metrics. Plot global expert hard/soft utilization over epochs.
+        Plots can be saved as checkpoint_dir/file_name.
+        """
+        method_name= "plot_expert_usage_global"
+
+        hard_hist, soft_hist= self._get_expert_hist(True, method_name)
+        if hard_hist is None or soft_hist is None:
+            return
+
+        fig, axes= self._set_expert_usage_plot(hard_hist, soft_hist, cut_first_epoch)
+
+        if save_charts:
+            self.save_plot(fig, file_name, as_pdf, method_name, "Expert usage charts were saved at")
+        if show_plot:
+            plt.show()
+        plt.close(fig)
+
+
+    def plot_expert_usage_layerwise(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                    as_pdf=False, file_name="expert_usage_layer"):
+        """
+        MoE metrics. Plot per-layer expert hard/soft utilization over epochs.
+        Plots can be saved as checkpoint_dir/file_name. Saves one figure per MoE layer.
+        """
+        method_name= "plot_expert_usage_layerwise"
+
+        layer_epoch= self._get_expert_hist(False, method_name)
+        if layer_epoch is None:
             return
 
         for layer_id, layer_hist in layer_epoch.items():
@@ -847,99 +880,131 @@ class Trainer:
             if len(hard_hist) == 0 or len(soft_hist) == 0:
                 continue
 
-            hard_hist= torch.stack(hard_hist).cpu()   # [n_epochs, E]
-            soft_hist= torch.stack(soft_hist).cpu()   # [n_epochs, E]
-
-            epochs= list(range(1, hard_hist.size(0) + 1))
-            if cut_first_epoch and len(epochs) > 1:
-                epochs= epochs[1:]
-                hard_hist= hard_hist[1:]
-                soft_hist= soft_hist[1:]
-
-            n_experts= hard_hist.size(1)
-            legend_ncol= min(n_experts, 8)
-            handles= []
-            labels = []
-            fig, axes= plt.subplots(1, 2, figsize=(14, 5))
-
-            # hard utilization
-            for expert_id in range(n_experts):
-                line,= axes[0].plot(
-                    epochs, hard_hist[:, expert_id].numpy(), marker="o", linestyle="-",
-                    label=f"Expert {expert_id}"
-                )
-                handles.append(line)
-                labels.append(f"Expert {expert_id}")
-            axes[0].set_title(f"Layer {layer_id} Hard Utilization")
-            axes[0].set_xlabel("Epochs")
-            axes[0].set_ylabel("Hard Fraction")
-            axes[0].grid(True, linestyle="--", alpha=0.7)
-
-            # soft importance
-            for expert_id in range(n_experts):
-                axes[1].plot(
-                    epochs, soft_hist[:, expert_id].numpy(), marker="o", linestyle="-",
-                    label=f"Expert {expert_id}"
-                )
-            axes[1].set_title(f"Layer {layer_id} Soft Importance")
-            axes[1].set_xlabel("Epochs")
-            axes[1].set_ylabel("Soft Fraction")
-            axes[1].grid(True, linestyle="--", alpha=0.7)
-
-            fig.legend(
-                handles, labels, loc="lower center", fancybox=True, ncol=legend_ncol, frameon=True,
-                bbox_to_anchor=(0.5, -0.04), fontsize=9
-            )
-            fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+            fig, axes= self._set_expert_usage_plot(hard_hist, soft_hist, cut_first_epoch, layer_id)
 
             if save_charts:
                 file_name_curr= f"{file_name}_{layer_id}"
-                info_message  = f"Layer {layer_id} expert usage chart was saved at"
+                info_message  = f"Layer {layer_id} expert usage charts were saved at"
                 self.save_plot(fig, file_name_curr, as_pdf, method_name, info_message)
             if show_plot:
                 plt.show()
             plt.close(fig)
 
 
-    def plot_expert_usage_heatmap(self, kind="hard", show_plot=True, save_charts=False, as_pdf=False,
-                                  file_name="expert_usage_heatmap"):
-        """
-        MoE metrics. Plot a heatmap of global expert usage over epochs.
-        - kind: 'hard' or 'soft'
-        Plots can be saved as checkpoint_dir/file_name.
-        """
-        method_name= "plot_expert_usage_heatmap"
+    @staticmethod
+    def _set_expert_usage_heatmap(hard_hist, soft_hist, cut_first_epoch:bool, layer_id=None):
 
-        hist= []
-        title= ""
-        if self.expert_traker is not None:
-            if kind == "hard":
-                hist = self.expert_traker.history["epoch_hard_fraction"]
-                title= "Global Expert Hard Utilization Heatmap"
-            elif kind == "soft":
-                hist = self.expert_traker.history["epoch_soft_fraction"]
-                title= "Global Expert Soft Importance Heatmap"
-            else:
-                raise ValueError("kind must be 'hard' or 'soft'")
+        def set_sparse_epoch_ticks(ax, n_epochs, max_ticks=10):
+            """
+            helper to avoid crowded x ticks.
+            """
+            step= max(1, int(np.ceil(n_epochs / max_ticks)))
+            ticks= list(range(0, n_epochs, step))
+            labels= [str(t + 1) for t in ticks]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels(labels)
 
-        if len(hist) == 0:
-            info_message= "No expert usage history available to plot."
-            self._log.info(f"{method_name} | {info_message}")
-            if self.verbose:
-                print(f"[INFO] {info_message}")
+        hard_mat= torch.stack(hard_hist).cpu().numpy()  # [n_epochs, E]
+        soft_mat= torch.stack(soft_hist).cpu().numpy()  # [n_epochs, E]
+
+        epoch_labels= list(range(1, hard_mat.shape[0] + 1))
+        if cut_first_epoch and hard_mat.shape[0] > 1:
+            hard_mat= hard_mat[1:]
+            soft_mat= soft_mat[1:]
+            epoch_labels= epoch_labels[1:]
+        n_epochs, n_experts = hard_mat.shape
+        # transpose so that experts are rows and epochs are columns.
+        hard_plot= hard_mat.T  # [E, n_epochs]
+        soft_plot= soft_mat.T  # [E, n_epochs]
+        vmin= 0.0
+        vmax= max(float(hard_plot.max()), float(soft_plot.max()))
+        fig, axes= plt.subplots(1, 2, figsize=(16, 5.5))
+
+        # hard utilization
+        im0= axes[0].imshow(
+            hard_plot, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax,
+        )
+        if layer_id is None:
+            axes[0].set_title("Global Expert Hard Utilization")
+        else:
+            axes[0].set_title(f"Layer {layer_id} Hard Utilization")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Expert ID")
+        set_sparse_epoch_ticks(axes[0], n_epochs)
+        axes[0].set_yticks(range(n_experts))
+        axes[0].set_yticklabels(range(n_experts))
+
+        # soft importance
+        im1= axes[1].imshow(
+            soft_plot, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax,
+        )
+        if layer_id is None:
+            axes[1].set_title("Global Expert Soft Importance")
+        else:
+            axes[1].set_title(f"Layer {layer_id} Soft Importance")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Expert ID")
+        set_sparse_epoch_ticks(axes[1], n_epochs)
+        axes[1].set_yticks(range(n_experts))
+        axes[1].set_yticklabels(range(n_experts))
+
+        # one shared colorbar for both heatmaps
+        fig.subplots_adjust(right=0.95, wspace=0.09)
+        cbar_ax= fig.add_axes(rect=(0.96, 0.16, 0.010, 0.68))
+        cbar= fig.colorbar(im1, cax=cbar_ax)
+        cbar.set_label("Fraction")
+
+        return fig, axes
+
+
+    def plot_expert_usage_global_heatmap(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                         as_pdf=False, file_name="expert_usage_global_heatmap"):
+        """
+        Plot global expert-usage heatmaps for hard/soft utilization side by side, with experts
+        on the y-axis and epochs on the x-axis. Plots can be saved as checkpoint_dir/file_name.
+        """
+        method_name= "plot_expert_usage_global_heatmap"
+
+        hard_hist, soft_hist= self._get_expert_hist(True, method_name)
+        if hard_hist is None or soft_hist is None:
             return
 
-        mat= torch.stack(hist).cpu().numpy().transpose()  # [E, n_epochs]
-        plt.figure(figsize=(10, 6))
-        plt.imshow(mat, aspect="auto", interpolation="nearest")
-        plt.colorbar(label=f"{kind.capitalize()} Fraction")
-        plt.title(title)
-        plt.xlabel("Expert ID")
-        plt.ylabel("Epoch")
+        fig, axes= self._set_expert_usage_heatmap(hard_hist, soft_hist, cut_first_epoch)
 
         if save_charts:
-            file_name= f"{file_name}_{kind}"
-            self.save_plot(plt, file_name, as_pdf, method_name, "Heatmap was saved at")
+            info_message= "Expert usage heatmaps were saved at"
+            self.save_plot(fig, file_name, as_pdf, method_name, info_message, tight=False)
         if show_plot:
             plt.show()
-        plt.close()
+        plt.close(fig)
+
+
+    def plot_expert_usage_layerwise_heatmap(self, cut_first_epoch=False, show_plot=True, save_charts=False,
+                                            as_pdf=False, file_name="expert_usage_layer_heatmap"):
+        """
+        Plot per-layer expert-usage heatmaps for hard/soft utilization side by side, with experts
+        on the y-axis and epochs on the x-axis. Plots can be saved as checkpoint_dir/file_name.
+        Saves one figure per MoE layer.
+        """
+        method_name= "plot_expert_usage_layerwise_heatmap"
+
+        layer_epoch= self._get_expert_hist(False, method_name)
+        if layer_epoch is None:
+            return
+
+        for layer_id, layer_hist in layer_epoch.items():
+            hard_hist= layer_hist["hard_fraction"]
+            soft_hist= layer_hist["soft_fraction"]
+
+            if len(hard_hist) == 0 or len(soft_hist) == 0:
+                continue
+
+            fig, axes= self._set_expert_usage_heatmap(hard_hist, soft_hist, cut_first_epoch, layer_id)
+
+            if save_charts:
+                file_name_curr= f"{file_name}_{layer_id}"
+                info_message  = f"Layer {layer_id} expert usage heatmaps were saved at"
+                self.save_plot(fig, file_name_curr, as_pdf, method_name, info_message, tight=False)
+            if show_plot:
+                plt.show()
+            plt.close(fig)
