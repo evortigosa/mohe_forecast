@@ -907,11 +907,9 @@ class Trainer:
         hard_mat= torch.stack(hard_hist).cpu().numpy()  # [n_epochs, E]
         soft_mat= torch.stack(soft_hist).cpu().numpy()  # [n_epochs, E]
 
-        epoch_labels= list(range(1, hard_mat.shape[0] + 1))
         if cut_first_epoch and hard_mat.shape[0] > 1:
             hard_mat= hard_mat[1:]
             soft_mat= soft_mat[1:]
-            epoch_labels= epoch_labels[1:]
         n_epochs, n_experts = hard_mat.shape
         # transpose so that experts are rows and epochs are columns.
         hard_plot= hard_mat.T  # [E, n_epochs]
@@ -921,7 +919,7 @@ class Trainer:
         fig, axes= plt.subplots(1, 2, figsize=(16, 5.5))
 
         # hard utilization
-        im0= axes[0].imshow(
+        axes[0].imshow(
             hard_plot, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax,
         )
         if layer_id is None:
