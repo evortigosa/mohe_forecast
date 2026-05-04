@@ -340,10 +340,13 @@ def main(device, use_fused, use_flashattn):
         trainer.train(epochs, use_bf16=use_bf16, clip_grad=clip_grad, get_moe_metrics=moe_metrics)
         if save_plots:
             trainer.plot_results(cut_first_epoch=cut_first, show_plot=False, save_charts=True, file_name=f"{plot_file}_losses")
-            trainer.plot_expert_usage_global(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage")
             trainer.plot_expert_routing_diagnostics(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_routing")
-            trainer.plot_expert_usage_layerwise(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_layerwise")
-            trainer.plot_expert_usage_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap")
+            if model_config.n_experts <= 8:
+                trainer.plot_expert_usage_global(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_global")
+                trainer.plot_expert_usage_layerwise(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_layer")
+            else:
+                trainer.plot_expert_usage_global_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap")
+                trainer.plot_expert_usage_layerwise_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap_layer")
 
     if do_test:
         _, _= trainer.load_checkpoint(filename=None, checkpoint_dir=check_dir)
