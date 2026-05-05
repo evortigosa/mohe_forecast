@@ -373,7 +373,7 @@ class KVCache:
         self.cache_len= 0
 
 
-    def init_cache(self, k, v) -> None:
+    def init_cache(self, k) -> None:
         """
         Initialize the cache.
         """
@@ -702,8 +702,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6,
                  d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
                  ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False,
-                 c_att_mode='full') -> None:
+                 exp_route_dropout=0.1, bias=False, rope_theta=10000.0, use_qk_norm=False,
+                 headwise_attn_gate=False, c_att_mode='full') -> None:
         super(TransformerBlock, self).__init__()
 
         # Self-Attention module to endogenous series
@@ -729,12 +729,13 @@ class TransformerBlock(nn.Module):
         self.norm3= self.get_norm(norm_type, d_model, init_alpha=0.2)
         self.ffn  = MoEFeedForward(
             d_model, d_ff, dropout, ffn_type, False, glu, n_experts, top_k_experts, experts_type,
-            bias
+            exp_route_dropout, bias
         )
         self.drop_path3= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
 
-    def get_norm(self, norm_type, d_model, init_alpha=0.5):
+    @staticmethod
+    def get_norm(norm_type, d_model, init_alpha=0.5):
         if norm_type == 'rms':
             return RMSNorm(d_model)
         elif norm_type == 'dyt':
@@ -756,7 +757,7 @@ class TransformerBlock(nn.Module):
         x_norm= self.norm3(x)
         x= x + self.drop_path3(self.ffn(x_norm))
 
-        return x, self.ffn.router_logits
+        return x, self.ffn.router_probs
 
 
 
@@ -781,8 +782,8 @@ class TransformerModel(nn.Module):
     def __init__(self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
                  n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
                  diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2,
-                 experts_type='fan', bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False,
-                 c_att_mode='full') -> None:
+                 experts_type='fan', exp_route_dropout=0.1, bias=False, rope_theta=10000.0, use_qk_norm=False,
+                 headwise_attn_gate=False, c_att_mode='full') -> None:
         super(TransformerModel, self).__init__()
         # block_size represents the max sequence length
         self.block_size= block_size
@@ -804,7 +805,8 @@ class TransformerModel(nn.Module):
             TransformerBlock(
                 multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout,
                 sdp_rates[depth], norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-                experts_type, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
+                experts_type, exp_route_dropout, bias, rope_theta, use_qk_norm, headwise_attn_gate,
+                c_att_mode
             ) for depth in range(n_layer)
         ])
         # final normalization layer after the last TransformerBlock
@@ -844,12 +846,12 @@ class TransformerModel(nn.Module):
             if self.causal_mask.device != x.device:
                 self.causal_mask= self.causal_mask.to(x.device)
 
-        all_router_logits= ()
+        all_router_probs= ()
         # forward the embedding through the transformer
         for block in self.transformer:
-            x, router_logits= block(
+            x, router_probs= block(
                 x, x_cross, start_pos, inference, self.causal_mask, self.flash_attn
             )
-            all_router_logits += (router_logits,)
+            all_router_probs += (router_probs,)
 
-        return self.final_norm(x), all_router_logits
+        return self.final_norm(x), all_router_probs
