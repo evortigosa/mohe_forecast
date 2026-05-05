@@ -90,6 +90,113 @@ class Trainer:
         return logger
 
 
+    @staticmethod
+    def _format_dt(seconds):
+        ms= seconds * 1000
+        seconds, milliseconds= divmod(ms, 1000)
+        minutes, seconds= divmod(seconds, 60)
+        hours, minutes= divmod(minutes, 60)
+
+        return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}.{int(milliseconds):03d}"
+
+
+    @torch.inference_mode()
+    def test(self, test_loader=None, test_criterion=nn.MSELoss(reduction='none'), inverse_transform=False):
+        """
+        Test the model on a test set.
+        Returns the mean test loss, test predictions, and test labels.
+        """
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        test_loader= self.test_loader if test_loader is None else test_loader
+        assert test_loader is not None, "test_loader cannot refer to None"
+
+        self.model.eval()
+        test_criterion= test_criterion if test_criterion is not None else self.criterion
+        test_loss= 0.0
+        n_samples= 0
+        all_logits, all_trues= [], []
+
+        if self.train_ds_scaler is not None:
+            inverse_transform= inverse_transform
+            scale_= torch.from_numpy(self.train_ds_scaler.scale_).float().view(1,-1,1).to(self.device)
+            mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1,-1,1).to(self.device)
+        else:
+            inverse_transform= False
+            scale_= 1.
+            mean_ = 0.
+
+        for batch in tqdm(test_loader, desc='Testing', disable=self.disable_tqdm):
+            # --- minibatch construction ---
+            if self.use_time_features:
+                data, target, data_time, target_time= batch
+                data_time  = data_time.to(self.device)
+                target_time= target_time.to(self.device)
+            else:
+                data, target= batch
+                data_time  = None
+                target_time= None
+            data  = data.to(self.device)
+            target= target.to(self.device)
+
+            # --- forward pass and get loss ---
+            if self.model.forecasting:
+                logits= self.model.forecast(data, ts_mark=data_time, ts_mark_future=target_time)
+                if inverse_transform:
+                    # invert the scaling back to the original units
+                    logits= logits * scale_ + mean_
+                    target= target * scale_ + mean_
+            else:
+                logits, *_= self.model(data, ts_mark=data_time)
+            losses= test_criterion(logits, target)
+            loss= torch.mean(losses)
+
+            # --- register preds and trues ---
+            test_loss += float(loss.item()) * data.size(0)
+            n_samples += data.size(0)
+            all_logits.append(logits.cpu())
+            all_trues.append(target.cpu())
+
+        test_loss= test_loss / n_samples
+
+        return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
+
+
+    @torch.inference_mode()
+    def validate(self, val_criterion=nn.MSELoss(reduction='none')):
+        """
+        Validate the model on a validation set.
+        """
+        self.model.eval()
+        val_criterion= val_criterion if val_criterion is not None else self.criterion
+        val_loss= 0.0
+        n_samples= 0
+
+        for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
+            # --- minibatch construction ---
+            if self.use_time_features:
+                data, target, data_time, _= batch
+                data_time= data_time.to(self.device)
+            else:
+                data, target= batch
+                data_time= None
+            data  = data.to(self.device)
+            target= target.to(self.device)
+
+            # --- forward pass and get loss ---
+            logits, *_= self.model(data, ts_mark=data_time)
+            losses= val_criterion(logits, target)
+            loss= torch.mean(losses)
+
+            val_loss += float(loss.item()) * data.size(0)
+            n_samples+= data.size(0)
+
+        val_loss= val_loss / n_samples
+
+        return val_loss
+
+
     def train_one_epoch(self, epoch, clip_grad=None, get_moe_metrics=False):
         """
         Train the model for one epoch, returning the training loss and learning rate.
@@ -119,7 +226,7 @@ class Trainer:
                 data= (self.augmentation(data)).to(self.device)
 
             # --- forward pass and get loss ---
-            logits, router_logits, *_= self.model(data, ts_mark=data_time)
+            logits, router_probs, *_= self.model(data, ts_mark=data_time)
             # compute training loss on the scaled data
             losses= self.criterion(logits, target)
             loss= torch.mean(losses)
@@ -130,7 +237,7 @@ class Trainer:
 
             if self.aux_criterion is not None:
                 aux_loss, global_metrics, layer_metrics= self.aux_criterion(
-                    router_logits, padding_mask, get_moe_metrics
+                    router_probs, padding_mask, get_moe_metrics
                 )
                 loss= loss + aux_loss
 
@@ -202,7 +309,7 @@ class Trainer:
             # --- forward pass and get loss ---
             # model, optimizer defined as usual; model parameters kept as float32
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits, router_logits, *_= self.model(data, ts_mark=data_time)
+                logits, router_probs, *_= self.model(data, ts_mark=data_time)
                 # compute training loss on the scaled data
                 losses= self.criterion(logits, target)
                 loss= torch.mean(losses)
@@ -213,7 +320,7 @@ class Trainer:
 
                 if self.aux_criterion is not None:
                     aux_loss, global_metrics, layer_metrics= self.aux_criterion(
-                        router_logits, padding_mask, get_moe_metrics
+                        router_probs, padding_mask, get_moe_metrics
                     )
                     loss= loss + aux_loss
 
@@ -252,40 +359,6 @@ class Trainer:
         epoch_lr  = epoch_lr / n_steps
 
         return train_loss, epoch_lr
-
-
-    def validate(self, val_criterion=nn.MSELoss(reduction='none')):
-        """
-        Validate the model on a validation set.
-        """
-        self.model.eval()
-        val_criterion= val_criterion if val_criterion is not None else self.criterion
-        val_loss= 0.0
-        n_samples= 0
-
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
-                # --- minibatch construction ---
-                if self.use_time_features:
-                    data, target, data_time, _= batch
-                    data_time= data_time.to(self.device)
-                else:
-                    data, target= batch
-                    data_time= None
-                data  = data.to(self.device)
-                target= target.to(self.device)
-
-                # --- forward pass and get loss ---
-                logits, *_= self.model(data, ts_mark=data_time)
-                losses= val_criterion(logits, target)
-                loss= torch.mean(losses)
-
-                val_loss += float(loss.item()) * data.size(0)
-                n_samples+= data.size(0)
-
-        val_loss= val_loss / n_samples
-
-        return val_loss
 
 
     def train(self, epochs, eval_interval=1, use_bf16=False, clip_grad=None, get_moe_metrics=False) -> None:
@@ -332,23 +405,23 @@ class Trainer:
                 self.expert_traker.finalize_epoch()
 
             end= time.time()
-            dt = end - start
+            dt = self._format_dt(end - start)
 
             if did_validation:
                 self._log.info(
-                    "train | epoch=%d/%d | train_loss=%.6f | val_loss=%.6f | lr=%.3e | dt=%.2fs",
+                    "train | epoch=%d/%d | train_loss=%.6f | val_loss=%.6f | lr=%.3e | dt=%sms",
                     epoch + 1, epochs, train_loss, val_loss, epoch_lr, dt
                 )
                 if self.verbose:
                     print(f'Train loss: {train_loss:.4f}')
-                    print(f'Valid loss: {val_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt*1000:.2f}ms')
+                    print(f'Valid loss: {val_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt}ms')
             else:  # did_validation is False
                 self._log.info(
-                    "train | epoch=%d/%d | train_loss=%.6f | val_loss not computed | lr=%.3e | dt=%.2fs",
+                    "train | epoch=%d/%d | train_loss=%.6f | val_loss not computed | lr=%.3e | dt=%sms",
                     epoch + 1, epochs, train_loss, epoch_lr, dt
                 )
                 if self.verbose:
-                    print(f'Train loss: {train_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt*1000:.2f}ms')
+                    print(f'Train loss: {train_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt}ms')
 
             if did_validation:
                 if val_loss < best_val_loss:
@@ -377,69 +450,6 @@ class Trainer:
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(best_epoch, best_val_loss)
-
-
-    def test(self, test_loader=None, test_criterion=nn.MSELoss(reduction='none'), inverse_transform=False):
-        """
-        Test the model on a test set.
-        Returns the mean test loss, test predictions, and test labels.
-        """
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        test_loader= self.test_loader if test_loader is None else test_loader
-        assert test_loader is not None, "test_loader cannot refer to None"
-
-        if self.train_ds_scaler is not None:
-            inverse_transform= inverse_transform
-            scale_= torch.from_numpy(self.train_ds_scaler.scale_).float().view(1,-1,1).to(self.device)
-            mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1,-1,1).to(self.device)
-        else:
-            inverse_transform= False
-            scale_= 1.
-            mean_ = 0.
-
-        self.model.eval()
-        test_criterion= test_criterion if test_criterion is not None else self.criterion
-        test_loss= 0.0
-        n_samples= 0
-        all_logits, all_trues= [], []
-
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc='Testing', disable=self.disable_tqdm):
-                # --- minibatch construction ---
-                if self.use_time_features:
-                    data, target, data_time, target_time= batch
-                    data_time  = data_time.to(self.device)
-                    target_time= target_time.to(self.device)
-                else:
-                    data, target= batch
-                    data_time  = None
-                    target_time= None
-                data  = data.to(self.device)
-                target= target.to(self.device)
-
-                # --- forward pass and get loss ---
-                if self.model.forecasting:
-                    logits= self.model.forecast(data, ts_mark=data_time, ts_mark_future=target_time)
-                    if inverse_transform:
-                        # invert the scaling back to the original units
-                        logits= logits * scale_ + mean_
-                        target= target * scale_ + mean_
-                else:
-                    logits, *_= self.model(data, ts_mark=data_time)
-                losses= test_criterion(logits, target)
-                loss= torch.mean(losses)
-
-                # --- register preds and trues ---
-                test_loss += float(loss.item()) * data.size(0)
-                n_samples += data.size(0)
-                all_logits.append(logits.cpu())
-                all_trues.append(target.cpu())
-
-        test_loss= test_loss / n_samples
-
-        return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
 
 
     def get_checkpoint_path(self, filename:str, checkpoint_dir:str):
