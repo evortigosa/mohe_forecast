@@ -693,7 +693,7 @@ class Trainer:
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
         plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.5)
 
         plt.subplot(1, 2, 2)
         plt.plot(epochs, lr_hist, label='Learning Rate', marker='o', linestyle='-', color='tab:green')
@@ -701,7 +701,7 @@ class Trainer:
         plt.xlabel('Epochs')
         plt.ylabel('Learning Rate')
         plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.5)
 
         if save_charts:
             self._save_plot(plt, file_name, as_pdf, method_name, "Training charts were saved at")
@@ -748,7 +748,7 @@ class Trainer:
         plt.xlabel("Epochs")
         plt.ylabel("Value")
         plt.legend()
-        plt.grid(True, linestyle="--", alpha=0.7)
+        plt.grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
 
         plt.subplot(1, 2, 2)
         plt.plot(epochs, cv_hard_hist, label="CV Hard", marker="o", linestyle="-")
@@ -757,7 +757,7 @@ class Trainer:
         plt.xlabel("Epochs")
         plt.ylabel("Coefficient of Variation")
         plt.legend()
-        plt.grid(True, linestyle="--", alpha=0.7)
+        plt.grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
 
         if save_charts:
             self._save_plot(plt, file_name, as_pdf, method_name, "Routing diagnostic charts were saved at")
@@ -828,7 +828,7 @@ class Trainer:
             axes[0].set_title(f"Layer {layer_id} Hard Utilization")
         axes[0].set_xlabel("Epochs")
         axes[0].set_ylabel("Hard Fraction")
-        axes[0].grid(True, linestyle="--", alpha=0.7)
+        axes[0].grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
 
         # soft importance
         for expert_id in range(n_experts):
@@ -842,7 +842,7 @@ class Trainer:
             axes[1].set_title(f"Layer {layer_id} Soft Importance")
         axes[1].set_xlabel("Epochs")
         axes[1].set_ylabel("Soft Fraction")
-        axes[1].grid(True, linestyle="--", alpha=0.7)
+        axes[1].grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
 
         fig.legend(
             handles, labels, loc="lower center", fancybox=True, ncol=legend_ncol, frameon=True,
