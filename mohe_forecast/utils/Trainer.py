@@ -380,7 +380,10 @@ class Trainer:
         did_validation= False
 
         for epoch in range(epochs):
+            if self.device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats()
             start= time.time()
+
             if self.expert_traker is not None:
                 self.expert_traker.reset_epoch()
 
@@ -404,24 +407,25 @@ class Trainer:
             if self.expert_traker is not None:
                 self.expert_traker.finalize_epoch()
 
+            peak_vram= (torch.cuda.max_memory_allocated()/1024**3) if self.device.type == 'cuda' else 0.
             end= time.time()
             dt = self._format_dt(end - start)
 
             if did_validation:
-                self._log.info(
-                    "train | epoch=%d/%d | train_loss=%.6f | val_loss=%.6f | lr=%.3e | dt=%sms",
-                    epoch + 1, epochs, train_loss, val_loss, epoch_lr, dt
-                )
-                if self.verbose:
-                    print(f'Train loss: {train_loss:.4f}')
-                    print(f'Valid loss: {val_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt}ms')
-            else:  # did_validation is False
-                self._log.info(
-                    "train | epoch=%d/%d | train_loss=%.6f | val_loss not computed | lr=%.3e | dt=%sms",
-                    epoch + 1, epochs, train_loss, epoch_lr, dt
-                )
-                if self.verbose:
-                    print(f'Train loss: {train_loss:.4f} | epoch: {epoch + 1} | dt/epoch: {dt}ms')
+                val_loss_log = f'{val_loss:.6f}'
+                val_loss_verb= f'Valid loss: {val_loss:.5f} | '
+            else:
+                val_loss_log = 'N/A'  # did_validation is False
+                val_loss_verb= ''
+
+            self._log.info(
+                "train | epoch=%d/%d | train_loss=%.6f | val_loss=%s | lr=%.3e | peak GPU mem=%.2fGB | dt=%sms",
+                epoch + 1, epochs, train_loss, val_loss_log, epoch_lr, peak_vram, dt
+            )
+            if self.verbose:
+                print(f'Train loss: {train_loss:.5f}')
+                print(f'{val_loss_verb}epoch: {epoch+1}/{epochs} | lr: {epoch_lr:.6f} | '
+                      f'peak GPU mem: {peak_vram:.2f}GB | dt/epoch: {dt}ms')
 
             if did_validation:
                 if val_loss < best_val_loss:
@@ -436,17 +440,16 @@ class Trainer:
                     avg_val_loss= np.mean(self.val_losses)
                     if self.early_stopping(avg_val_loss, epoch+1):
                         self._log.warning(
-                            "train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f",
-                            epoch + 1, avg_val_loss
+                            "train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f", epoch+1, avg_val_loss
                         )
                         if self.verbose:
                             print(f'[WARNING] Early stopping triggered during training at epoch {epoch+1}')
                         break
 
         if did_validation:
-            self._log.info("train | Best Validation Loss: %.6f | Epoch: %d", best_val_loss, best_epoch + 1)
+            self._log.info("train | Best Validation Loss: %.6f | Epoch: %d", best_val_loss, best_epoch+1)
             if self.verbose:
-                print(f'Best Validation Loss: {best_val_loss:.4f} (Epoch {best_epoch + 1})')
+                print(f'Best Validation Loss: {best_val_loss:.5f} (Epoch {best_epoch+1})')
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(best_epoch, best_val_loss)
@@ -508,7 +511,7 @@ class Trainer:
 
 
     @staticmethod
-    def strip_module_prefix(state_dict):
+    def _strip_module_prefix(state_dict):
         """
         Remove a single leading 'module.' from keys if present.
         """
@@ -535,7 +538,7 @@ class Trainer:
         try:
             checkpoint= torch.load(checkpoint_path, map_location=self.device)
             # restore model state
-            self.model.load_state_dict(self.strip_module_prefix(checkpoint['model_state_dict']))
+            self.model.load_state_dict(self._strip_module_prefix(checkpoint['model_state_dict']))
             # ensure model on target device
             if getattr(self, 'model', None) is not None:
                 self.model.to(self.device)
@@ -637,7 +640,7 @@ class Trainer:
             raise e
 
 
-    def save_plot(self, plt_obj, file_name, as_pdf, method_name, info_message, tight=True) -> None:
+    def _save_plot(self, plt_obj, file_name, as_pdf, method_name, info_message, tight=True) -> None:
         plots_dir= f"{self.checkpoint_dir}/plots"
         os.makedirs(plots_dir, exist_ok=True)
         save_path= self.get_checkpoint_path(file_name, plots_dir)
@@ -701,7 +704,7 @@ class Trainer:
         plt.grid(True, linestyle='--', alpha=0.7)
 
         if save_charts:
-            self.save_plot(plt, file_name, as_pdf, method_name, "Training charts were saved at")
+            self._save_plot(plt, file_name, as_pdf, method_name, "Training charts were saved at")
         if show_plot:
             plt.show()
         plt.close()
@@ -757,7 +760,7 @@ class Trainer:
         plt.grid(True, linestyle="--", alpha=0.7)
 
         if save_charts:
-            self.save_plot(plt, file_name, as_pdf, method_name, "Routing diagnostic charts were saved at")
+            self._save_plot(plt, file_name, as_pdf, method_name, "Routing diagnostic charts were saved at")
         if show_plot:
             plt.show()
         plt.close()
@@ -865,7 +868,7 @@ class Trainer:
         fig, axes= self._set_expert_usage_plot(hard_hist, soft_hist, cut_first_epoch)
 
         if save_charts:
-            self.save_plot(fig, file_name, as_pdf, method_name, "Expert usage charts were saved at")
+            self._save_plot(fig, file_name, as_pdf, method_name, "Expert usage charts were saved at")
         if show_plot:
             plt.show()
         plt.close(fig)
@@ -895,7 +898,7 @@ class Trainer:
             if save_charts:
                 file_name_curr= f"{file_name}_{layer_id}"
                 info_message  = f"Layer {layer_id} expert usage charts were saved at"
-                self.save_plot(fig, file_name_curr, as_pdf, method_name, info_message)
+                self._save_plot(fig, file_name_curr, as_pdf, method_name, info_message)
             if show_plot:
                 plt.show()
             plt.close(fig)
@@ -981,7 +984,7 @@ class Trainer:
 
         if save_charts:
             info_message= "Expert usage heatmaps were saved at"
-            self.save_plot(fig, file_name, as_pdf, method_name, info_message, tight=False)
+            self._save_plot(fig, file_name, as_pdf, method_name, info_message, tight=False)
         if show_plot:
             plt.show()
         plt.close(fig)
@@ -1012,7 +1015,7 @@ class Trainer:
             if save_charts:
                 file_name_curr= f"{file_name}_{layer_id}"
                 info_message  = f"Layer {layer_id} expert usage heatmaps were saved at"
-                self.save_plot(fig, file_name_curr, as_pdf, method_name, info_message, tight=False)
+                self._save_plot(fig, file_name_curr, as_pdf, method_name, info_message, tight=False)
             if show_plot:
                 plt.show()
             plt.close(fig)
