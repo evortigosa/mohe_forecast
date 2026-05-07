@@ -108,6 +108,8 @@ class Trainer:
         """
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        start= time.time()
 
         test_loader= self.test_loader if test_loader is None else test_loader
         assert test_loader is not None, "test_loader cannot refer to None"
@@ -159,6 +161,14 @@ class Trainer:
             all_trues.append(target.cpu())
 
         test_loss= test_loss / n_samples
+
+        peak_vram= (torch.cuda.max_memory_allocated()/1024**3) if self.device.type == 'cuda' else 0.
+        end= time.time()
+        dt = self._format_dt(end - start)
+        self._log.info(
+            "test | test_loss=%.6f | loss type=%s | peak GPU mem=%.2fGB | dt=%sms",
+            test_loss, f'{test_criterion}', peak_vram, dt
+        )
 
         return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
 
@@ -413,7 +423,7 @@ class Trainer:
 
             if did_validation:
                 val_loss_log = f'{val_loss:.6f}'
-                val_loss_verb= f'Valid loss: {val_loss:.5f} | '
+                val_loss_verb= f'Valid loss: {val_loss_log} | '
             else:
                 val_loss_log = 'N/A'  # did_validation is False
                 val_loss_verb= ''
@@ -423,7 +433,7 @@ class Trainer:
                 epoch + 1, epochs, train_loss, val_loss_log, epoch_lr, peak_vram, dt
             )
             if self.verbose:
-                print(f'Train loss: {train_loss:.5f}')
+                print(f'Train loss: {train_loss:.6f}')
                 print(f'{val_loss_verb}epoch: {epoch+1}/{epochs} | lr: {epoch_lr:.6f} | '
                       f'peak GPU mem: {peak_vram:.2f}GB | dt/epoch: {dt}ms')
 
@@ -449,7 +459,7 @@ class Trainer:
         if did_validation:
             self._log.info("train | Best Validation Loss: %.6f | Epoch: %d", best_val_loss, best_epoch+1)
             if self.verbose:
-                print(f'Best Validation Loss: {best_val_loss:.5f} (Epoch {best_epoch+1})')
+                print(f'Best Validation Loss: {best_val_loss:.6f} (Epoch {best_epoch+1})')
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(best_epoch, best_val_loss)
@@ -475,6 +485,7 @@ class Trainer:
     def save_checkpoint(self, epoch, best_val_loss) -> None:
         """
         Save the model checkpoint to disk, including training history.
+        - save expert tracker (if not None): traker_path is {checkpoint_path}_expert_traker.pt
         """
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         checkpoint_path= self.get_checkpoint_path(f'{self.filename}.pth', self.checkpoint_dir)
@@ -498,8 +509,7 @@ class Trainer:
                 torch.save(self.expert_traker.state_dict(), traker_path)
 
             self._log.info(
-                "save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s",
-                epoch + 1, best_val_loss, checkpoint_path
+                "save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s", epoch+1, best_val_loss, checkpoint_path
             )
             if self.verbose:
                 print(f"[INFO] Checkpoint saved at '{checkpoint_path}'")
@@ -524,7 +534,8 @@ class Trainer:
                         restore_metadata=False) -> tuple:
         """
         This method loads the checkpoint from the given path and restores the model, optimizer
-        (optional, when restore_optimizer=True), and training history.
+        (optional, when restore_optimizer=True), and training history (optional, when restore_metadata=True).
+        - restore expert tracker (optional): expected traker_path is {checkpoint_path}_expert_traker.pt
         - TODO: Fix dtype, device, and layout for optimizer state loading.
         """
         checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
@@ -536,7 +547,7 @@ class Trainer:
             raise RuntimeError("self.model is None: instantiate model before restoring state_dict")
 
         try:
-            checkpoint= torch.load(checkpoint_path, map_location=self.device)
+            checkpoint= torch.load(checkpoint_path, map_location=self.device, weights_only=True)
             # restore model state
             self.model.load_state_dict(self._strip_module_prefix(checkpoint['model_state_dict']))
             # ensure model on target device
@@ -556,7 +567,7 @@ class Trainer:
                         self.scheduler.optimizer= self.optimizer
 
             # retrieve training metadata
-            epoch= checkpoint['epoch']
+            epoch= checkpoint.get("epoch", 0)
             best_val_loss= checkpoint.get('best_val_loss', float('inf'))
             if restore_metadata:
                 self.train_losses= checkpoint.get('train_losses', [])
@@ -570,7 +581,7 @@ class Trainer:
 
                 if os.path.exists(traker_path) or tracker is not None:
                     if os.path.exists(traker_path):
-                        tracker= torch.load(traker_path, map_location="cpu")
+                        tracker= torch.load(traker_path, map_location="cpu", weights_only=True)
                     self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
                     self.expert_traker.load_state_dict(tracker)
                 else:
@@ -608,7 +619,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
         try:
-            checkpoint= torch.load(checkpoint_path, map_location='cpu')
+            checkpoint= torch.load(checkpoint_path, map_location='cpu', weights_only=True)
             if 'config' not in checkpoint:
                 raise KeyError("Checkpoint does not contain a 'config' key to build the model")
 
