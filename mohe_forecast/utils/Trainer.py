@@ -569,6 +569,8 @@ class Trainer:
             # retrieve training metadata
             epoch= checkpoint.get("epoch", 0)
             best_val_loss= checkpoint.get('best_val_loss', float('inf'))
+            _time= checkpoint.get("timestamp", "N/A")
+            _time= time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_time)) if _time != "N/A" else "N/A"
             if restore_metadata:
                 self.train_losses= checkpoint.get('train_losses', [])
                 self.val_losses= checkpoint.get('val_losses', [])
@@ -592,11 +594,12 @@ class Trainer:
                         print("[WARNING] No MoE usage history to load: skipping expert_traker restore.")
 
             self._log.info(
-                "load_checkpoint | Checkpoint loaded from '%s'. Resuming training with best validation loss of %.4f.",
-                checkpoint_path, best_val_loss
+                "load_checkpoint | Checkpoint loaded from '%s'. Resuming training on '%s' with best validation loss of %.6f.",
+                checkpoint_path, _time, best_val_loss
             )
             if self.verbose:
-                print(f"[INFO] Checkpoint loaded from '{checkpoint_path}'. Resuming training with best validation loss of {best_val_loss:.4f}.")
+                print(f"[INFO] Checkpoint loaded from '{checkpoint_path}'. Resuming training on '{_time}' "
+                      f"with best validation loss of {best_val_loss:.6f}.")
             return epoch, best_val_loss
 
         except Exception as e:
