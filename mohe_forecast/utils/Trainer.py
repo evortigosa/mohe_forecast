@@ -100,6 +100,18 @@ class Trainer:
         return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}.{int(milliseconds):03d}"
 
 
+    def _get_cuda_memory_stats(self):
+        """
+        Return the maximum peak GPU memory usage in GB.
+        """
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+            peak_vram= torch.cuda.max_memory_allocated(self.device)/1024**3
+            return peak_vram
+
+        return 0.
+
+
     @torch.inference_mode()
     def test(self, test_loader=None, test_criterion=nn.MSELoss(reduction='none'), inverse_transform=False):
         """
@@ -108,7 +120,8 @@ class Trainer:
         """
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
         start= time.time()
 
         test_loader= self.test_loader if test_loader is None else test_loader
@@ -162,7 +175,7 @@ class Trainer:
 
         test_loss= test_loss / n_samples
 
-        peak_vram= (torch.cuda.max_memory_allocated()/1024**3) if self.device.type == 'cuda' else 0.
+        peak_vram= self._get_cuda_memory_stats()
         end= time.time()
         dt = self._format_dt(end - start)
         self._log.info(
@@ -390,9 +403,10 @@ class Trainer:
         did_validation= False
 
         for epoch in range(epochs):
-            if self.device.type == 'cuda':
-                torch.cuda.reset_peak_memory_stats()
             start= time.time()
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+                torch.cuda.reset_peak_memory_stats(self.device)
 
             if self.expert_traker is not None:
                 self.expert_traker.reset_epoch()
@@ -417,7 +431,7 @@ class Trainer:
             if self.expert_traker is not None:
                 self.expert_traker.finalize_epoch()
 
-            peak_vram= (torch.cuda.max_memory_allocated()/1024**3) if self.device.type == 'cuda' else 0.
+            peak_vram= self._get_cuda_memory_stats()
             end= time.time()
             dt = self._format_dt(end - start)
 
