@@ -29,7 +29,6 @@ class BaseConfig:
     - dropout (float): Default is 0.2. Defines the dropout rate.
     - drop_path (float): Default is 0.3. Defines the DropPath rate.
     - norm_type (str): Default is 'rms'. This can be 'layer', 'rms', 'dyt' (experimental).
-    - flash_attn (bool): Default is True. Enables FlashAttention.
     - diff_attn (bool): Default is False. Enables Differential Attention (experimental).
     - ffn_type (str): Default is 'dwconv'. This can be 'mlp', 'conv', 'dwconv', 'fan'.
     - glu (bool): Default is False. Enables the Gated Linear Unit (GLU) architecture for experts.
@@ -68,7 +67,6 @@ class BaseConfig:
     dropout:float= 0.2
     drop_path:float= 0.3
     norm_type:str= 'rms'           # layer, rms, dyt
-    flash_attn:bool= True          # enables FlashAttention
     diff_attn:bool= False          # enables Differential Attention (WIP)
     ffn_type:str= 'dwconv'         # mlp, conv, dwconv, fan
     glu:bool= False                # enables the Gated Linear Unit (GLU) architecture for experts

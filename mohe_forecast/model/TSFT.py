@@ -47,10 +47,10 @@ class TSFTransformer(nn.Module):
     def __init__(
         self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
         is_causal=False, forecasting=True, mask_ratio=0., mask_type='random', n_layer=6, d_model=256, block_size=672,
-        n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', flash_attn=True,
-        diff_attn=False, ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-        exp_route_dropout=0.1, output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
-        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False,
+        n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
+        ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0.1,
+        output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0, use_input_norm=True,
+        emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False,
         cls_token=False, c_att_mode='full'
     ) -> None:
         super(TSFTransformer, self).__init__()
@@ -133,8 +133,8 @@ class TSFTransformer(nn.Module):
         # define the backbone transformer model
         self.backbone= TransformerModel(
             multi_modal, is_causal, n_layer, d_model, patch_dim, n_heads, n_kv_heads, d_ff, dropout,
-            drop_path, norm_type, flash_attn, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-            experts_type, exp_route_dropout, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
+            drop_path, norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts, experts_type,
+            exp_route_dropout, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
         )
 
         patch_dim= patch_dim - 1 if cls_token else patch_dim
@@ -164,8 +164,8 @@ class TSFTransformer(nn.Module):
         self.config= BaseConfig(
             self.patch_width, channels, self.n_outputs, self.width_factor, multi_modal,
             self.is_causal, self.forecasting, mask_ratio, mask_type, n_layer, d_model, self.block_size,
-            n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, flash_attn, diff_attn, ffn_type,
-            glu, n_experts, top_k_experts, experts_type, exp_route_dropout, output_head_type, fine_tune,
+            n_heads, n_kv_heads, d_ff, dropout, drop_path, norm_type, diff_attn, ffn_type, glu,
+            n_experts, top_k_experts, experts_type, exp_route_dropout, output_head_type, fine_tune,
             unpatch, bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout, use_qk_norm,
             headwise_attn_gate, cls_token, c_att_mode
         )
@@ -204,10 +204,9 @@ class TSFTransformer(nn.Module):
         return f"SSL mode enabled with random mask and mask_ratio={mask_ratio}"
 
 
-    def switch_model_type(self, head, flash_attn=None):
+    def switch_model_type(self, head, flash_attn):
         # get the inverse of self.is_causal
         is_causal = not self.is_causal
-        flash_attn= self.backbone.flash_attn if flash_attn is None else flash_attn
 
         if is_causal:
             assert isinstance(head, DecoderHead), "Head must be a DecoderHead for switching model type"
@@ -300,7 +299,7 @@ class TSFTransformer(nn.Module):
         self.eval()
         try:
             for i in range(n_patches):
-                logits, *_= self.forward(ts, 0, ts_mark=ts_mark)
+                logits, *_= self.forward(ts, ts_mark=ts_mark, flash_attn=False)
                 if end_f_patch_width > 0:
                     future= logits[:, :, -f_patch_width:-end_f_patch_width]
                 else:
@@ -332,10 +331,11 @@ class TSFTransformer(nn.Module):
         return "--- Encoder-only model ---"
 
 
-    def forward(self, ts, start_pos=0, ts_mark=None, ext_cls_token=None):
+    def forward(self, ts, ts_mark=None, ext_cls_token=None, flash_attn=True):
         """
-        - ts_mark is an optional input for exogenous covariates.
-        - ext_cls_token (optional) input that informs the model that it has an external CLS token (MAE decoder)
+        - ts_mark (optional): Input tensor for exogenous covariates.
+        - ext_cls_token (optional): Informs the model that ts has an external CLS token (MAE decoder)
+        - flash_attn (bool): Default is True. Enables FlashAttention.
         """
         B, C, T= ts.size()  # ts (batch_size, channels/features, seq_length)
         assert T <= self.block_size, \
@@ -381,7 +381,7 @@ class TSFTransformer(nn.Module):
                 x, x_cross= self.mask_layer(x, x_cross)
 
         # forward the embeddings through the transformer
-        x, router_probs= self.backbone(x, x_cross, start_pos, inference)
+        x, router_probs= self.backbone(x, x_cross, inference, flash_attn)
 
         has_cls_tk= (self.cls_token is not None) or (ext_cls_token is not None)
 
