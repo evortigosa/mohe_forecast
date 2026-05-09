@@ -112,6 +112,21 @@ class Trainer:
         return 0.
 
 
+    @staticmethod
+    def _get_minibatch(batch, use_time_features:bool):
+        """
+        Minibatch construction from a DataLoader batch.
+        """
+        if use_time_features:
+            data, target, data_time, target_time= batch
+        else:
+            data, target= batch
+            data_time  = None
+            target_time= None
+
+        return data, target, data_time, target_time
+
+
     @torch.inference_mode()
     def test(self, test_loader=None, test_criterion=nn.MSELoss(reduction='none'), inverse_transform=False):
         """
@@ -144,16 +159,10 @@ class Trainer:
 
         for batch in tqdm(test_loader, desc='Testing', disable=self.disable_tqdm):
             # --- minibatch construction ---
-            if self.use_time_features:
-                data, target, data_time, target_time= batch
-                data_time  = data_time.to(self.device)
-                target_time= target_time.to(self.device)
-            else:
-                data, target= batch
-                data_time  = None
-                target_time= None
-            data  = data.to(self.device)
-            target= target.to(self.device)
+            data, target, data_time, target_time= self._get_minibatch(batch, self.use_time_features)
+            data, target= data.to(self.device), target.to(self.device)
+            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
+            target_time= target_time.to(self.device) if isinstance(target_time, torch.Tensor) else None
 
             # --- forward pass and get loss ---
             if self.model.forecasting:
@@ -198,14 +207,9 @@ class Trainer:
 
         for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
             # --- minibatch construction ---
-            if self.use_time_features:
-                data, target, data_time, _= batch
-                data_time= data_time.to(self.device)
-            else:
-                data, target= batch
-                data_time= None
-            data  = data.to(self.device)
-            target= target.to(self.device)
+            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
+            data, target= data.to(self.device), target.to(self.device)
+            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
 
             # --- forward pass and get loss ---
             logits, *_= self.model(data, ts_mark=data_time)
@@ -214,6 +218,39 @@ class Trainer:
 
             val_loss += float(loss.item()) * data.size(0)
             n_samples+= data.size(0)
+
+        val_loss= val_loss / n_samples
+
+        return val_loss
+
+
+    @torch.inference_mode()
+    def validate_bf16(self, val_criterion=nn.MSELoss(reduction='none')):
+        """
+        Validate the model on a validation set using bfloat16.
+        """
+        assert self.device.type == 'cuda', "BF16 training requires CUDA"
+
+        self.model.eval()
+        val_criterion= val_criterion if val_criterion is not None else self.criterion
+        val_loss= 0.0
+        n_samples= 0
+
+        for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
+            # --- minibatch construction ---
+            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
+            data, target= data.to(self.device), target.to(self.device)
+            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
+
+            # --- forward pass and get loss ---
+            # model defined as usual; model parameters kept as float32
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits, *_= self.model(data, ts_mark=data_time)
+                losses= val_criterion(logits, target)
+                loss= torch.mean(losses)
+
+                val_loss += float(loss.item()) * data.size(0)
+                n_samples+= data.size(0)
 
         val_loss= val_loss / n_samples
 
@@ -235,15 +272,9 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
-            if self.use_time_features:
-                data, target, data_time, _= batch
-                data_time= data_time.to(self.device)
-            else:
-                data, target= batch
-                data_time= None
-
-            data  = data.to(self.device)
-            target= target.to(self.device)
+            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
+            data, target= data.to(self.device), target.to(self.device)
+            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
             padding_mask= None
             if self.augmentation is not None:
                 data= (self.augmentation(data)).to(self.device)
@@ -316,15 +347,9 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
-            if self.use_time_features:
-                data, target, data_time, _= batch
-                data_time= data_time.to(self.device)
-            else:
-                data, target= batch
-                data_time= None
-
-            data  = data.to(self.device)
-            target= target.to(self.device)
+            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
+            data, target= data.to(self.device), target.to(self.device)
+            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
             padding_mask= None
             if self.augmentation is not None:
                 data= (self.augmentation(data)).to(self.device)
@@ -422,7 +447,10 @@ class Trainer:
             self.lr_hist.append(epoch_lr)
 
             if self.do_validation and (epoch % eval_interval == 0 or epoch == epochs-1):
-                val_loss= self.validate()
+                if use_bf16:
+                    val_loss= self.validate_bf16()
+                else:
+                    val_loss= self.validate()
                 did_validation= True
             else:
                 did_validation= False
