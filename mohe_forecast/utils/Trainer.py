@@ -61,22 +61,38 @@ class Trainer:
         self._log= self._build_logger(f"{self.__class__.__name__}")
 
 
+    def get_checkpoint_path(self, filename:str, checkpoint_dir:str) -> str:
+        """
+        Return the path to the checkpoint file.
+        """
+        if (filename is not None) and (checkpoint_dir is None):
+            # assume that filename holds the complete checkpoint_path
+            checkpoint_path= os.path.join(filename)
+        elif (filename is None) and (checkpoint_dir is not None):
+            # filename takes the default value
+            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
+        else:
+            if (filename is None) and (checkpoint_dir is None):
+                checkpoint_dir= self.checkpoint_dir
+                filename= f'{self.filename}.pth'
+            checkpoint_path= os.path.join(str(checkpoint_dir), str(filename))
+
+        return str(checkpoint_path)
+
+
     def _build_logger(self, name):
         """
         Build a logger for the Trainer class.
         """
-        filename= f'{self.filename}.log'
-        checkpoint_dir= self.checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        log_path= os.path.abspath(os.path.join(checkpoint_dir, filename))
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        log_path= self.get_checkpoint_path(f'{self.filename}.log', self.checkpoint_dir)
 
         logger= logging.getLogger(name)
         logger.setLevel(logging.INFO)
         logger.propagate= False
 
         fmt= logging.Formatter(
-            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
+            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
         # file handler
         for h in logger.handlers:
@@ -91,7 +107,7 @@ class Trainer:
 
 
     @staticmethod
-    def _format_dt(seconds):
+    def _format_dt(seconds) -> str:
         ms= seconds * 1000
         seconds, milliseconds= divmod(ms, 1000)
         minutes, seconds= divmod(seconds, 60)
@@ -100,7 +116,20 @@ class Trainer:
         return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}.{int(milliseconds):03d}"
 
 
-    def _get_cuda_memory_stats(self):
+    def _reset_cuda_memory_stats(self, empty_cache=False, reset_peak_memory=False):
+        """
+        Empty cache (empty_cache=True) and reset the maximum peak GPU memory usage
+        (reset_peak_memory=True).
+        """
+        if self.device.type == 'cuda':
+            if empty_cache:
+                torch.cuda.empty_cache()
+            if reset_peak_memory:
+                torch.cuda.synchronize(self.device)
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+
+    def _get_cuda_memory_stats(self) -> float:
         """
         Return the maximum peak GPU memory usage in GB.
         """
@@ -133,12 +162,6 @@ class Trainer:
         Test the model on a test set.
         Returns the mean test loss, test predictions, and test labels.
         """
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(self.device)
-            torch.cuda.reset_peak_memory_stats(self.device)
-        start= time.time()
-
         test_loader= self.test_loader if test_loader is None else test_loader
         assert test_loader is not None, "test_loader cannot refer to None"
 
@@ -156,6 +179,9 @@ class Trainer:
             inverse_transform= False
             scale_= 1.
             mean_ = 0.
+
+        start= time.time()
+        self._reset_cuda_memory_stats(empty_cache=True, reset_peak_memory=True)
 
         for batch in tqdm(test_loader, desc='Testing', disable=self.disable_tqdm):
             # --- minibatch construction ---
@@ -416,8 +442,7 @@ class Trainer:
         self._log.info(f"train | use_bf16={use_bf16}, clip_grad={clip_grad}, get_moe_metrics={get_moe_metrics}")
         self._log.info(f"train | Model full config: {self.model.config}")
 
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
+        self._reset_cuda_memory_stats(empty_cache=True)
 
         if get_moe_metrics and self.expert_traker is None:
             self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
@@ -429,9 +454,7 @@ class Trainer:
 
         for epoch in range(epochs):
             start= time.time()
-            if self.device.type == 'cuda':
-                torch.cuda.synchronize(self.device)
-                torch.cuda.reset_peak_memory_stats(self.device)
+            self._reset_cuda_memory_stats(reset_peak_memory=True)
 
             if self.expert_traker is not None:
                 self.expert_traker.reset_epoch()
@@ -505,23 +528,6 @@ class Trainer:
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(best_epoch, best_val_loss)
-
-
-    def get_checkpoint_path(self, filename:str, checkpoint_dir:str):
-
-        if (filename is not None) and (checkpoint_dir is None):
-            # assume that filename holds the complete checkpoint_path
-            checkpoint_path= os.path.join(filename)
-        elif (filename is None) and (checkpoint_dir is not None):
-            # filename takes the default value
-            checkpoint_path= os.path.join(checkpoint_dir, f'{self.filename}.pth')
-        else:
-            if (filename is None) and (checkpoint_dir is None):
-                checkpoint_dir= self.checkpoint_dir
-                filename= f'{self.filename}.pth'
-            checkpoint_path= os.path.join(str(checkpoint_dir), str(filename))
-
-        return str(checkpoint_path)
 
 
     def save_checkpoint(self, epoch, best_val_loss) -> None:
