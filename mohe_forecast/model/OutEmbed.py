@@ -82,13 +82,13 @@ class UnPatchV3(nn.Module):
     See https://arxiv.org/abs/2201.03545
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False, ch_independence=True) -> None:
         super(UnPatchV3, self).__init__()
         assert d_model % patch_width == 0, "d_model must be divisible by patch_width"
-        self.channels = channels
+        self.channels= channels
         pw_d_model= round_channels(d_model // patch_width)
         hidden_dim= round_channels(pw_d_model * 4)
-        out_channels= 1
+        out_channels= 1 if ch_independence else channels
         # calculate kernel_size and padding of the depthwise conv based on patch_width
         dks= min(max(((patch_width // 2) - 1), 1), 7)  # [1, 7]
         dks= dks - 1 if dks % 2 == 0 else dks
@@ -142,12 +142,12 @@ class UnPatch(nn.Module):
     See https://arxiv.org/abs/2201.03545
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False, ch_independence=True) -> None:
         super(UnPatch, self).__init__()
         assert d_model % 4 == 0, "d_model must be divisible by 4"
         self.channels= channels
         hidden_dim= round_channels(d_model // 4)
-        out_channels= 1
+        out_channels= 1 if ch_independence else channels
         # calculate kernel_size and padding of the depthwise conv based on patch_width
         dks= min(max(((patch_width // 2) - 1), 1), 7)  # [1, 7]
         dks= dks - 1 if dks % 2 == 0 else dks
@@ -200,11 +200,12 @@ class LinearUnPatch(nn.Module):
     - From a (B, P, C) tensor into a (B, D, H) forecast.
     """
 
-    def __init__(self, n_patches, channels, d_model, n_outputs, dropout=0.2,
-                 bias=False, individual=False) -> None:
+    def __init__(self, n_patches, channels, d_model, n_outputs, dropout=0.2, bias=False, ch_independence=True,
+                 individual=False) -> None:
         super(LinearUnPatch, self).__init__()
         self.channels  = channels
         self.individual= individual
+        self.out_channels= 1 if ch_independence else channels
         input_dim= n_patches * d_model
 
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
@@ -214,6 +215,7 @@ class LinearUnPatch(nn.Module):
                 nn.Linear(input_dim, n_outputs, bias=bias) for _ in range(channels)
             ])
         else:
+            n_outputs= n_outputs * self.out_channels
             self.proj= nn.Linear(input_dim, n_outputs, bias=bias)
 
         # initialize Linear modules with Glorot / fan_avg
@@ -224,12 +226,15 @@ class LinearUnPatch(nn.Module):
 
 
     def forward(self, x):
-        BC, _, _= x.shape  # (batch_size * channels/features, num_patches, d_model)
+        B, _, _= x.shape  # (batch_size * channels/features, num_patches, d_model)
 
         if self.individual:
-            B= BC // self.channels
-            # flatten patches+embed into one vector per batch
-            x_flat= x.reshape(B, self.channels, -1)
+            if self.out_channels == 1:
+                B= B // self.channels
+                # flatten patches+embed into one vector per batch
+                x_flat= x.reshape(B, self.channels, -1)
+            else:
+                x_flat= x.reshape(B, -1).unsqueeze(1).repeat(1, self.channels, 1)
             # (batch_size, channels/features, num_patches * d_model)
             c_ts= []
             for i, c_proj in enumerate(self.proj):
@@ -243,15 +248,15 @@ class LinearUnPatch(nn.Module):
             ts= torch.stack(c_ts, dim=1)    # (batch_size, channels/features, seq_length)
         else:
             # flatten patches+embed into one vector per batch
-            x_flat= x.reshape(BC, -1)
+            x_flat= x.reshape(B, -1)
             # (batch_size * channels/features, num_patches * d_model)
             if self.dropout is not None:
                 x_flat= self.dropout(x_flat)
             # project to T
             ts= self.proj(x_flat)  # (batch_size * channels/features, seq_length)
-            ts= ts.reshape(-1, self.channels, ts.size(-1))  # (batch_size, channels, seq_length)
+            ts= ts.reshape(-1, self.channels, ts.size(-1) // self.out_channels)
 
-        return ts.contiguous()  # (batch_size, channels, seq_length)
+        return ts.contiguous()  # (batch_size, channels/features, seq_length)
 
 
 
@@ -262,52 +267,20 @@ class DecoderHead(nn.Module):
     """
 
     def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
-                 head_type='mlp', bias=False, fine_tune=False, unpatch='conv') -> None:
+                 head_type='mlp', bias=False, fine_tune=False, unpatch='conv', ch_independence=True) -> None:
         super(DecoderHead, self).__init__()
         # decoder projection head
         self.d_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
         if unpatch == 'linear':
-            self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias)
+            self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias, ch_independence)
         else:
-            self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias)
+            self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias, ch_independence)
 
 
     def forward(self, x):
         x= self.d_head(x)
 
         return self.unpatch(x)
-
-
-
-class EncoderSSLHead(nn.Module):
-    """
-    Define the final head for Encoder-only models under SSL pre-training mode (receives
-    feature_maps to UnPatch, output shape -> [batch_size, channels/features, seq_length]
-    when mask_type is not 'mae'; otherwise, outputs feature_maps).
-    """
-
-    def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
-                 mask_type='mae', head_type='mlp', bias=False, fine_tune=False, unpatch='conv') -> None:
-        super(EncoderSSLHead, self).__init__()
-        # MAE head (encoder side) under SSL pre-training mode
-        if mask_type == 'mae':
-            self.e_head= nn.Identity()
-        else:
-            if unpatch == 'linear':
-                unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias)
-            else:
-                unpatch= UnPatch(patch_width, channels, d_model, dropout, bias)
-
-            self.e_head= nn.Sequential(
-                OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune),
-                unpatch,
-            )
-
-
-    def forward(self, x):
-        x= self.e_head(x)
-
-        return x
 
 
 
@@ -319,9 +292,9 @@ class EncoderHead(nn.Module):
     classification head otherwise (receives cls_tokens, output shape -> [batch_size, n_outputs]).
     """
 
-    def __init__(self, forecasting, patch_width, n_patches, channels, d_model, d_ff, n_outputs,
-                 dropout=0.2, mask_type='mae', head_type='mlp', bias=False, fine_tune=False,
-                 unpatch='conv') -> None:
+    def __init__(self, forecasting, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
+                 mask_type='mae', head_type='mlp', bias=False, fine_tune=False, unpatch='conv',
+                 ch_independence=True) -> None:
         super(EncoderHead, self).__init__()
         self.forecasting= forecasting
         self.mask_type= mask_type
@@ -333,11 +306,12 @@ class EncoderHead(nn.Module):
             # encoder forecasting head
             self.e_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
             if unpatch == 'linear':
-                self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias)
+                self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias, ch_independence)
             else:
-                self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias)
+                self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias, ch_independence)
         else:
             # encoder classification head
+            channels= channels if ch_independence else 1
             self.e_head= OutputBlock(
                 False, channels*d_model, d_ff, n_outputs, dropout, head_type, bias, fine_tune
             ) if n_outputs > 0 else nn.Identity()
@@ -353,3 +327,36 @@ class EncoderHead(nn.Module):
 
         x= x.reshape(x.shape[0], -1)
         return self.e_head(x)
+
+
+
+class EncoderSSLHead(nn.Module):
+    """
+    Define the final head for Encoder-only models under SSL pre-training mode (receives
+    feature_maps to UnPatch, output shape -> [batch_size, channels/features, seq_length]
+    when mask_type is not 'mae'; otherwise, outputs feature_maps).
+    """
+
+    def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
+                 mask_type='mae', head_type='mlp', bias=False, fine_tune=False, unpatch='conv',
+                 ch_independence=True) -> None:
+        super(EncoderSSLHead, self).__init__()
+        # MAE head (encoder side) under SSL pre-training mode
+        if mask_type == 'mae':
+            self.e_head= nn.Identity()
+        else:
+            if unpatch == 'linear':
+                unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias, ch_independence)
+            else:
+                unpatch= UnPatch(patch_width, channels, d_model, dropout, bias, ch_independence)
+
+            self.e_head= nn.Sequential(
+                OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune),
+                unpatch,
+            )
+
+
+    def forward(self, x):
+        x= self.e_head(x)
+
+        return x

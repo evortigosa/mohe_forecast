@@ -333,15 +333,15 @@ class PatchEmbeddingV3(nn.Module):
     - v3: uses RMSNorm as the normalization layer.
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, ch_independence=True) -> None:
         super(PatchEmbeddingV3, self).__init__()
         self.patch_width= patch_width
         self.d_model= d_model
-        channels= 1
+        self.channels= 1 if ch_independence else channels
 
         # define convolutional patch embedding
         self.embed= nn.Conv1d(  # (batch_size, d_model, num_patches)
-            channels, d_model, kernel_size=patch_width, stride=patch_width, bias=False
+            self.channels, d_model, kernel_size=patch_width, stride=patch_width, bias=False
         )
         # define normalization and dropout modules for regularization
         self.norm= RMSNorm(d_model)
@@ -361,8 +361,9 @@ class PatchEmbeddingV3(nn.Module):
     def forward(self, ts):
         # ts -> (batch_size, channels/features, seq_length)
         B, C, T= ts.size()
-        ts= ts.reshape(-1, T).unsqueeze(1)  # (batch_size * channels/features, 1, seq_length)
-        # ensure channel independence, batch_size assume batch_size * channels/features
+        if self.channels == 1:
+            ts= ts.reshape(-1, T).unsqueeze(1)  # (batch_size * channels/features, 1, seq_length)
+            # ensure channel independence, batch_size assume batch_size * channels/features
 
         x= self.embed(ts)
         # x -> (B * C, d_model, num_patches)
@@ -384,15 +385,15 @@ class PatchEmbedding(nn.Module):
     - v4: uses GroupNorm as the normalization layer.
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, ch_independence=True) -> None:
         super(PatchEmbedding, self).__init__()
         self.patch_width= patch_width
         self.d_model= d_model
-        channels= 1
+        self.channels= 1 if ch_independence else channels
 
         # define convolutional patch embedding
         self.embed= nn.Conv1d(  # (batch_size, d_model, num_patches)
-            channels, d_model, kernel_size=patch_width, stride=patch_width, bias=False
+            self.channels, d_model, kernel_size=patch_width, stride=patch_width, bias=False
         )
         # define normalization and dropout modules for regularization
         self.norm= nn.GroupNorm(num_groups=1, num_channels=d_model)
@@ -416,8 +417,9 @@ class PatchEmbedding(nn.Module):
     def forward(self, ts):
         # ts -> (batch_size, channels/features, seq_length)
         B, C, T= ts.size()
-        ts= ts.reshape(-1, T).unsqueeze(1)  # (batch_size * channels/features, 1, seq_length)
-        # ensure channel independence, batch_size assume batch_size * channels/features
+        if self.channels == 1:
+            ts= ts.reshape(-1, T).unsqueeze(1)  # (batch_size * channels/features, 1, seq_length)
+            # ensure channel independence, batch_size assume batch_size * channels/features
 
         x= self.embed(ts)
         # x -> (B * C, d_model, num_patches)
