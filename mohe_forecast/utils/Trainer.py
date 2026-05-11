@@ -440,7 +440,7 @@ class Trainer:
         Train the model for a specified number of epochs, performing validation and checkpointing.
         """
         train_info= f'use_bf16={use_bf16}, clip_grad={clip_grad}, get_moe_metrics={get_moe_metrics}'
-        opt_info  = f'weight_decay={self.optimizer.param_groups[0]['weight_decay']}, betas={self.optimizer.param_groups[0]["betas"]}'
+        opt_info  = f'weight_decay={self.optimizer.param_groups[0]["weight_decay"]}, betas={self.optimizer.param_groups[0]["betas"]}'
         scheduler_info= self.scheduler.extra_repr() if self.scheduler is not None else "N/A"
         model_info= f'model full config: {self.model.config}'
         self._log.info(f"train | {train_info} | optimizer info: {opt_info} | scheduler info: {scheduler_info} | {model_info}")
