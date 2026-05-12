@@ -37,7 +37,7 @@ class QKRoPE(nn.Module):
         # computing inverse frequencies for each pair in the head dimension in a register_buffer
         self.register_buffer('inv_freq', 1.0 / (self.theta ** (
             torch.arange(0, d_head, 2, dtype=torch.int64)[: (d_head // 2)].float() / d_head
-        )))
+        )), persistent=False)
 
 
     def extra_repr(self):

@@ -576,8 +576,11 @@ class Trainer:
     @staticmethod
     def _strip_module_prefix(state_dict):
         """
-        Remove a single leading 'module.' from keys if present.
+        Ignore all 'inv_freq' keys (from previous versions of RoPE with persistent register_buffer),
+        as well as remove a single leading 'module.' from keys if present.
         """
+        state_dict= {k: v for k, v in state_dict.items() if "inv_freq" not in k}
+
         if any(k.startswith("module.") for k in state_dict.keys()):
             return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
         return state_dict
