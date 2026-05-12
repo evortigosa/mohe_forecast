@@ -106,6 +106,21 @@ class Trainer:
         return logger
 
 
+    def _set_log(self, log_type:str, message:str)-> None:
+        """
+        Set a log entry. log_type can be "info", "warning", or "error".
+        """
+        if log_type.lower() == "warning" or log_type.lower() == "error":
+            self._log.warning(message)
+            log_type= f"[{log_type.upper()}]"
+        else:
+            self._log.info(message)
+            log_type= "[INFO]"
+
+        if self.verbose:
+            print(f"{log_type} {message}")
+
+
     @staticmethod
     def _format_dt(seconds) -> str:
         ms= seconds * 1000
@@ -213,9 +228,9 @@ class Trainer:
         peak_vram= self._get_cuda_memory_stats()
         end= time.time()
         dt = self._format_dt(end - start)
-        self._log.info(
-            "test | test_loss=%.6f | loss type=%s | peak GPU mem=%.2fGB | dt=%sms",
-            test_loss, f'{test_criterion}', peak_vram, dt
+        self._set_log(
+            "info", f"test | test_loss=%.6f | loss type=%s | peak GPU mem=%.2fGB | dt=%sms" % \
+             (test_loss, f'{test_criterion}', peak_vram, dt)
         )
 
         return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
@@ -326,11 +341,11 @@ class Trainer:
 
             # check loss finite
             if not torch.isfinite(loss).all():
-                self._log.warning(
-                    "train_one_epoch | non_finite_loss | epoch=%d | loss=%s", epoch, str(loss.detach().cpu())
+                self._set_log("error",
+                    f"train_one_epoch | non_finite_loss | epoch=%d | loss=%s" % (epoch, str(loss.detach().cpu()))
                 )
                 # best to raise early to see where it happened
-                raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
+                raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss.detach().cpu()}")
 
             # --- backward pass to calculate the gradients ---
             loss.backward()
@@ -403,11 +418,11 @@ class Trainer:
 
             # check loss finite
             if not torch.isfinite(loss).all():
-                self._log.warning(
-                    "train_one_epoch_bf16 | non_finite_loss | epoch=%d | loss=%s", epoch, str(loss.detach().cpu())
+                self._set_log("error",
+                    f"train_one_epoch_bf16 | non_finite_loss | epoch=%d | loss=%s" % (epoch, str(loss.detach().cpu()))
                 )
                 # best to raise early to see where it happened
-                raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss}")
+                raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss.detach().cpu()}")
 
             # --- backward pass to calculate the gradients ---
             # gradients computed in BF16, but accumulation and params remain TF32
@@ -440,12 +455,10 @@ class Trainer:
         Train the model for a specified number of epochs, performing validation and checkpointing.
         """
         train_info= f'use_bf16={use_bf16}, clip_grad={clip_grad}, get_moe_metrics={get_moe_metrics}'
-        opt_info  = f'weight_decay={self.optimizer.param_groups[0]["weight_decay"]}, betas={self.optimizer.param_groups[0]["betas"]}'
+        opt_info  = f'weight_decay={self.optimizer.param_groups[0]["weight_decay"]:.2e}, betas={self.optimizer.param_groups[0]["betas"]}'
         scheduler_info= self.scheduler.extra_repr() if self.scheduler is not None else "N/A"
         model_info= f'model full config: {self.model.config}'
-        self._log.info(f"train | {train_info} | optimizer info: {opt_info} | scheduler info: {scheduler_info} | {model_info}")
-        if self.verbose:
-            print(f"[INFO] train | {train_info} | optimizer info: {opt_info} | scheduler info: {scheduler_info} | {model_info}")
+        self._set_log("info", f"train | {train_info} | optimizer info: {opt_info} | scheduler info: {scheduler_info} | {model_info}")
 
         self._reset_cuda_memory_stats(empty_cache=True)
 
@@ -454,7 +467,7 @@ class Trainer:
 
         best_val_loss= float('inf')
         best_epoch= -1
-        val_loss= 10.
+        val_loss= 0.
         did_validation= False
 
         for epoch in range(epochs):
@@ -490,22 +503,11 @@ class Trainer:
             peak_vram= self._get_cuda_memory_stats()
             end= time.time()
             dt = self._format_dt(end - start)
-
-            if did_validation:
-                val_loss_log = f'{val_loss:.6f}'
-                val_loss_verb= f'Valid loss: {val_loss_log} | '
-            else:
-                val_loss_log = 'N/A'  # did_validation is False
-                val_loss_verb= ''
-
-            self._log.info(
-                "train | epoch=%d/%d | train_loss=%.6f | val_loss=%s | lr=%.3e | peak GPU mem=%.2fGB | dt=%sms",
-                epoch + 1, epochs, train_loss, val_loss_log, epoch_lr, peak_vram, dt
+            val_loss_log= f'{val_loss:.6f}' if did_validation else 'N/A'  # did_validation is False
+            self._set_log("info",
+                f"train | epoch=%d/%d | train_loss=%.6f | val_loss=%s | lr=%.4e | peak GPU mem=%.2fGB | dt=%sms" % \
+                (epoch+1, epochs, train_loss, val_loss_log, epoch_lr, peak_vram, dt)
             )
-            if self.verbose:
-                print(f'Train loss: {train_loss:.6f}')
-                print(f'{val_loss_verb}epoch: {epoch+1}/{epochs} | lr: {epoch_lr:.6f} | '
-                      f'peak GPU mem: {peak_vram:.2f}GB | dt/epoch: {dt}ms')
 
             if did_validation:
                 if val_loss < best_val_loss:
@@ -517,19 +519,16 @@ class Trainer:
 
                 if self.early_stopping is not None:
                     # Watches validation MSE and halts training if it hasn't improved
-                    avg_val_loss= np.mean(self.val_losses)
+                    avg_val_loss= float(np.mean(self.val_losses))
                     if self.early_stopping(avg_val_loss, epoch+1):
-                        self._log.warning(
-                            "train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f", epoch+1, avg_val_loss
+                        self._set_log(
+                            "warning", f"train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f" % \
+                            (epoch+1, avg_val_loss)
                         )
-                        if self.verbose:
-                            print(f'[WARNING] Early stopping triggered during training at epoch {epoch+1}')
                         break
 
         if did_validation:
-            self._log.info("train | Best Validation Loss: %.6f | Epoch: %d", best_val_loss, best_epoch+1)
-            if self.verbose:
-                print(f'Best Validation Loss: {best_val_loss:.6f} (Epoch {best_epoch+1})')
+            self._set_log("info", f"train | Best Validation Loss: %.6f | Epoch: %d" % (best_val_loss, best_epoch+1))
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
                 self.save_checkpoint(best_epoch, best_val_loss)
@@ -560,16 +559,12 @@ class Trainer:
             if self.expert_traker is not None:
                 traker_path= self.get_checkpoint_path(f'{self.filename}_expert_traker.pt', self.checkpoint_dir)
                 torch.save(self.expert_traker.state_dict(), traker_path)
-
-            self._log.info(
-                "save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s", epoch+1, best_val_loss, checkpoint_path
+            self._set_log(
+                "info", f"save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s" % \
+                 (epoch+1, best_val_loss, checkpoint_path)
             )
-            if self.verbose:
-                print(f"[INFO] Checkpoint saved at '{checkpoint_path}'")
         except Exception as e:
-            self._log.warning("save_checkpoint | Failed to save checkpoint: %s", e)
-            if self.verbose:
-                print(f"[ERROR] Failed to save checkpoint: {e}")
+            self._set_log("error", f"save_checkpoint | Failed to save checkpoint: {e}")
             raise e
 
 
@@ -597,9 +592,11 @@ class Trainer:
         checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
 
         if not os.path.exists(checkpoint_path):
+            self._set_log("error", f"load_checkpoint | Checkpoint file not found: {checkpoint_path}")
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
         # ensure model exists before loading (build_model will create it)
         if getattr(self, 'model', None) is None:
+            self._set_log("error", "load_checkpoint | self.model is None: instantiate model before restoring state_dict")
             raise RuntimeError("self.model is None: instantiate model before restoring state_dict")
 
         try:
@@ -612,11 +609,9 @@ class Trainer:
             # restore optimizer state
             if restore_optimizer:
                 if getattr(self, "optimizer", None) is None:
-                    self._log.warning(
-                        "load_checkpoint | Checkpoint contains optimizer state, but self.optimizer is None: skipping optimizer restore."
+                    self._set_log("warning",
+                        "load_checkpoint | restore_optimizer=True but self.optimizer is None: skipping optimizer restore."
                     )
-                    if self.verbose:
-                        print("[WARNING] Checkpoint contains optimizer state, but self.optimizer is None: skipping optimizer restore.")
                 else:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     if self.scheduler is not None:
@@ -643,27 +638,16 @@ class Trainer:
                     self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
                     self.expert_traker.load_state_dict(tracker)
                 else:
-                    self._log.warning(
-                        "load_checkpoint | No MoE usage history to load: skipping expert_traker restore."
-                    )
-                    if self.verbose:
-                        print("[WARNING] No MoE usage history to load: skipping expert_traker restore.")
+                    self._set_log("warning", "load_checkpoint | No MoE usage history to load: skipping expert_traker restore.")
 
-            self._log.info(
-                "load_checkpoint | Checkpoint loaded from '%s'. Resuming training on '%s' with best validation loss of %.6f.",
-                checkpoint_path, _time, best_val_loss
+            self._set_log("info",
+                "load_checkpoint | Checkpoint loaded from '%s'. Resuming training on '%s' with best validation loss of %.6f." % \
+                (checkpoint_path, _time, best_val_loss)
             )
-            if self.verbose:
-                print(f"[INFO] Checkpoint loaded from '{checkpoint_path}'. Resuming training on '{_time}' "
-                      f"with best validation loss of {best_val_loss:.6f}.")
             return epoch, best_val_loss
 
         except Exception as e:
-            self._log.warning(
-                "load_checkpoint | Failed to load checkpoint from %s: %s", checkpoint_path, e
-            )
-            if self.verbose:
-                print(f"[ERROR] Failed to load checkpoint from {checkpoint_path}: {e}")
+            self._set_log("error", f"load_checkpoint | Failed to load checkpoint from {checkpoint_path}: {e}")
             raise e
 
 
@@ -675,21 +659,22 @@ class Trainer:
         checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
 
         if not os.path.exists(checkpoint_path):
+            self._set_log("error", f"build_model | Checkpoint file not found: {checkpoint_path}")
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
         try:
             checkpoint= torch.load(checkpoint_path, map_location='cpu', weights_only=True)
             if 'config' not in checkpoint:
+                self._set_log("error", f"build_model | Checkpoint does not contain a 'config' key")
                 raise KeyError("Checkpoint does not contain a 'config' key to build the model")
 
             # build a fresh model from config (dict) hyperparameters
             config_args= checkpoint['config']
             if not isinstance(config_args, dict):
+                self._set_log("error", f"build_model | checkpoint['config'] should be a dict of constructor kwargs")
                 raise TypeError("checkpoint['config'] should be a dict of constructor kwargs")
 
-            self._log.info("build_model | Building a new model with config: %s", config_args)
-            if self.verbose:
-                print(f'[INFO] Building a new model with config: {config_args}')
+            self._set_log("info", f"build_model | Building a new model with config: {config_args}")
             self.model= TSFTransformer(**config_args).to(self.device)
 
             epoch= 0
@@ -702,11 +687,7 @@ class Trainer:
             return self.model, epoch, best_val_loss
 
         except Exception as e:
-            self._log.warning(
-                "build_model | Failed to build and load checkpoint from %s: %s", checkpoint_path, e
-            )
-            if self.verbose:
-                print(f"[ERROR] Failed to build and load checkpoint from {checkpoint_path}: {e}")
+            self._set_log("error", f"build_model | Failed to build and load checkpoint from {checkpoint_path}: {e}")
             raise e
 
 
@@ -724,9 +705,7 @@ class Trainer:
             save_path= f'{save_path}.svg'
             plt_obj.savefig(save_path, pad_inches=0.01, bbox_inches="tight")
 
-        self._log.info(f"{method_name} | {info_message}: {save_path}")
-        if self.verbose:
-            print(f"[INFO] {info_message}: {save_path}")
+        self._set_log("info", f"{method_name} | {info_message}: {save_path}")
 
 
     def plot_results(self, cut_first_epoch=False, show_plot=True, save_charts=False, as_pdf=False,
@@ -739,9 +718,7 @@ class Trainer:
 
         if len(self.train_losses) == 0:
             info_message= "No training/validation history available to plot."
-            self._log.info(f"{method_name} | {info_message}")
-            if self.verbose:
-                print(f"[INFO] {info_message}")
+            self._set_log("warning", f"{method_name} | {info_message}")
             return
 
         epochs= range(1, len(self.train_losses) + 1)
@@ -797,9 +774,7 @@ class Trainer:
 
         if len(entropy_hist) == 0:
             info_message= "No routing diagnostic history available to plot."
-            self._log.info(f"{method_name} | {info_message}")
-            if self.verbose:
-                print(f"[INFO] {info_message}")
+            self._set_log("warning", f"{method_name} | {info_message}")
             return
 
         epochs= list(range(1, len(entropy_hist) + 1))
@@ -846,9 +821,7 @@ class Trainer:
 
             if len(hard_hist) == 0 or len(soft_hist) == 0:
                 info_message= "No expert usage history available to plot."
-                self._log.info(f"{method_name} | {info_message}")
-                if self.verbose:
-                    print(f"[INFO] {info_message}")
+                self._set_log("warning", f"{method_name} | {info_message}")
                 return None, None
 
             return hard_hist, soft_hist
@@ -859,9 +832,7 @@ class Trainer:
 
         if len(layer_epoch) == 0:
             info_message= "No layerwise expert usage history available to plot."
-            self._log.info(f"{method_name} | {info_message}")
-            if self.verbose:
-                print(f"[INFO] {info_message}")
+            self._set_log("warning", f"{method_name} | {info_message}")
             return None
 
         return layer_epoch

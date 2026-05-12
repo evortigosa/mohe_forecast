@@ -26,7 +26,7 @@ class CosineLRDecay:
 
 
     def extra_repr(self):
-        return f"min_lr={self.min_lr}, max_lr={self.max_lr}, warmup_steps={self.warmup_steps}"
+        return f"min_lr={self.min_lr:.2e}, max_lr={self.max_lr:.2e}, warmup_steps={self.warmup_steps}"
 
 
     def get_last_lr(self):
