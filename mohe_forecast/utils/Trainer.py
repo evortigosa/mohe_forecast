@@ -106,7 +106,7 @@ class Trainer:
         return logger
 
 
-    def _set_log(self, log_type:str, message:str)-> None:
+    def _set_log(self, log_type:str, message:str) -> None:
         """
         Set a log entry. log_type can be "info", "warning", or "error".
         """
@@ -325,7 +325,6 @@ class Trainer:
             # compute training loss on the scaled data
             losses= self.criterion(logits, target)
             loss= torch.mean(losses)
-
             # sample‑weighted average loss
             train_loss += float(loss.item()) * data.size(0)
             n_samples += data.size(0)
@@ -354,7 +353,6 @@ class Trainer:
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
-
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -402,7 +400,6 @@ class Trainer:
                 # compute training loss on the scaled data
                 losses= self.criterion(logits, target)
                 loss= torch.mean(losses)
-
                 # sample‑weighted average loss
                 train_loss += float(loss.item()) * data.size(0)
                 n_samples += data.size(0)
@@ -433,7 +430,6 @@ class Trainer:
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
-
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -667,7 +663,6 @@ class Trainer:
             if 'config' not in checkpoint:
                 self._set_log("error", f"build_model | Checkpoint does not contain a 'config' key")
                 raise KeyError("Checkpoint does not contain a 'config' key to build the model")
-
             # build a fresh model from config (dict) hyperparameters
             config_args= checkpoint['config']
             if not isinstance(config_args, dict):
@@ -683,7 +678,6 @@ class Trainer:
                 epoch, best_val_loss= self.load_checkpoint(
                     filename, checkpoint_dir, restore_optimizer, restore_metadata
                 )
-
             return self.model, epoch, best_val_loss
 
         except Exception as e:
@@ -691,7 +685,7 @@ class Trainer:
             raise e
 
 
-    def _save_plot(self, plt_obj, file_name, as_pdf, method_name, info_message, tight=True) -> None:
+    def _save_plot(self, plt_obj, file_name, as_pdf, info_message, tight=True) -> None:
         plots_dir= f"{self.checkpoint_dir}/plots"
         os.makedirs(plots_dir, exist_ok=True)
         save_path= self.get_checkpoint_path(file_name, plots_dir)
@@ -705,7 +699,7 @@ class Trainer:
             save_path= f'{save_path}.svg'
             plt_obj.savefig(save_path, pad_inches=0.01, bbox_inches="tight")
 
-        self._set_log("info", f"{method_name} | {info_message}: {save_path}")
+        self._set_log("info", f"{info_message}: {save_path}")
 
 
     def plot_results(self, cut_first_epoch=False, show_plot=True, save_charts=False, as_pdf=False,
@@ -751,7 +745,7 @@ class Trainer:
         plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.5)
 
         if save_charts:
-            self._save_plot(plt, file_name, as_pdf, method_name, "Training charts were saved at")
+            self._save_plot(plt, file_name, as_pdf, f"{method_name} | Training charts were saved at")
         if show_plot:
             plt.show()
         plt.close()
@@ -805,7 +799,7 @@ class Trainer:
         plt.grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
 
         if save_charts:
-            self._save_plot(plt, file_name, as_pdf, method_name, "Routing diagnostic charts were saved at")
+            self._save_plot(plt, file_name, as_pdf, f"{method_name} | Routing diagnostic charts were saved at")
         if show_plot:
             plt.show()
         plt.close()
@@ -909,7 +903,7 @@ class Trainer:
         fig, axes= self._set_expert_usage_plot(hard_hist, soft_hist, cut_first_epoch)
 
         if save_charts:
-            self._save_plot(fig, file_name, as_pdf, method_name, "Expert usage charts were saved at")
+            self._save_plot(fig, file_name, as_pdf, f"{method_name} | Expert usage charts were saved at")
         if show_plot:
             plt.show()
         plt.close(fig)
@@ -939,7 +933,7 @@ class Trainer:
             if save_charts:
                 file_name_curr= f"{file_name}_{layer_id}"
                 info_message  = f"Layer {layer_id} expert usage charts were saved at"
-                self._save_plot(fig, file_name_curr, as_pdf, method_name, info_message)
+                self._save_plot(fig, file_name_curr, as_pdf, f"{method_name} | {info_message}")
             if show_plot:
                 plt.show()
             plt.close(fig)
@@ -1025,7 +1019,7 @@ class Trainer:
 
         if save_charts:
             info_message= "Expert usage heatmaps were saved at"
-            self._save_plot(fig, file_name, as_pdf, method_name, info_message, tight=False)
+            self._save_plot(fig, file_name, as_pdf, f"{method_name} | {info_message}", tight=False)
         if show_plot:
             plt.show()
         plt.close(fig)
@@ -1056,7 +1050,7 @@ class Trainer:
             if save_charts:
                 file_name_curr= f"{file_name}_{layer_id}"
                 info_message  = f"Layer {layer_id} expert usage heatmaps were saved at"
-                self._save_plot(fig, file_name_curr, as_pdf, method_name, info_message, tight=False)
+                self._save_plot(fig, file_name_curr, as_pdf, f"{method_name} | {info_message}", tight=False)
             if show_plot:
                 plt.show()
             plt.close(fig)
