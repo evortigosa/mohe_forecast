@@ -8,36 +8,21 @@ import ast
 import inspect
 import torch
 import torch.nn as nn
-
+import lightning as L
+import torch.distributed as dist
 from dataclasses import fields, replace
+
 from mohe_forecast.model import TSFTransformer
 from mohe_forecast.model.Config import TinyConfig, SmallConfig, BaseConfig, LargeConfig, UltraConfig
 from mohe_forecast.data_provider.loaders import get_ett_data_loaders, get_custom_data_loaders
-from mohe_forecast.utils import CosineLRDecay, EarlyStopping, LoadBalancingLoss, Trainer
+from mohe_forecast.utils import CosineLRDecay, EarlyStopping, LoadBalancingLoss, Trainer, DTrainer
 from mohe_forecast.utils.Metrics import eval_forecast_horizons
 
 
 
 CONFIG_MAP= {
-    "base": BaseConfig, "tiny": TinyConfig, "small": SmallConfig,
-    "large": LargeConfig, "ultra": UltraConfig,
+    "base": BaseConfig, "tiny": TinyConfig, "small": SmallConfig, "large": LargeConfig, "ultra": UltraConfig,
 }
-DEVICE= 'cuda' if torch.cuda.is_available() else 'cpu'
-USE_FUSED= False
-USE_FLASHATTN= False
-
-
-if DEVICE== 'cuda':
-    # TF32 computationally more efficient (slightly the same precision of FP32)
-    torch.backends.cudnn.fp32_precision= 'tf32'
-    # enable flash attention
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cudnn.deterministic= True
-    # create AdamW optimizer and use the fused version of it is available
-    fused_available= 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    # fused is a lot faster when it is available and when running on cuda
-    USE_FUSED= fused_available
-    USE_FLASHATTN= torch.backends.cuda.flash_sdp_enabled()
 
 
 def parse_value(value:str):
@@ -115,7 +100,7 @@ def build_parser():
                         help="Enable or disable model setup_optimizer on weight decayed parameters")
     parser.add_argument("--loss", type=str, default='huber', help="Loss criterion can be HuberLoss or MSELoss")
     parser.add_argument("--stop-patience", type=int, default=5, help="Number of patience epochs for early stopping")
-    parser.add_argument("--stop-min",   type=float, default=1e-6, help="Min delta for early stopping")
+    parser.add_argument("--stop-min",   type=float, default=1e-9, help="Min delta for early stopping")
     parser.add_argument("--clip-grad", type=parse_value, default=None,
                         help="Set a value (float) to clip_grad_norm_ on training")
     parser.add_argument("--train", action=argparse.BooleanOptionalAction, default=True,
@@ -133,6 +118,13 @@ def build_parser():
     parser.add_argument("--plot-cut-first", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable first epoch results in plot files")
     parser.add_argument("--seed", type=parse_value, default=None, help="Random number generator seed")
+    # distributed operation
+    parser.add_argument("--devices", type=int, default=1, help="Number of distributed devices to run on")
+    parser.add_argument("--num-nodes", type=int, default=1, help="Number of cluster nodes for distributed operation")
+    parser.add_argument("--strategy", type=str, default=None, help="Lightning Fabric accelerator")
+    parser.add_argument("--precision", type=str, default="bf16-mixed", help="Lightning Fabric precision")
+    parser.add_argument("--plugins", type=parse_value, default=None, help="To connect arbitrary backends, precision libraries, etc")
+    parser.add_argument("--callbacks", type=parse_value, default=None, help="Methods that the training loop can call at a specific time")
 
     return parser
 
@@ -142,18 +134,18 @@ def count_parameters(model) -> None:
     print(f'Number of model parameters: {total_params:,}')
 
 
-def setup_model_from_checkpoint(filename, checkpoint_dir, device, verbose=True):
+def setup_model_from_checkpoint(filename, checkpoint_dir, verbose=True):
     trainer= Trainer(
-        model=None, device=device, train_loader=None, train_ds_scaler=None, val_loader=None, test_loader=None, 
+        model=None, device="cpu", train_loader=None, train_ds_scaler=None, val_loader=None, test_loader=None,
         criterion=None, optimizer=None, checkpoint_dir=checkpoint_dir, filename=filename, verbose=verbose
     )
-    model, _, _= trainer.build_model(filename=None, checkpoint_dir=checkpoint_dir)
+    model= trainer.build_model(filename=None, checkpoint_dir=checkpoint_dir)
     del trainer
 
     return model, model.config
 
 
-def setup_model(model_size, device, args):
+def setup_model(model_size, args):
     if model_size.lower() not in ('tiny', 'small', 'base', 'large', 'ultra'):
         raise ValueError("model_size must be one of: 'tiny', 'small', 'base', 'large', 'ultra'.")
 
@@ -181,7 +173,7 @@ def setup_model(model_size, device, args):
     # apply overrides
     config= replace(config, **overrides)
 
-    model= TSFTransformer.from_config(config).to(device)
+    model= TSFTransformer.from_config(config)
 
     return model, model.config
 
@@ -238,11 +230,12 @@ def setup_data_loaders(
 
 def setup_trainer(
     model, device, use_fused, train_loader, val_loader, test_loader, scaler_obj, time_covariates,
-    checkpoint_dir, filename, epochs=10, max_lr=3.2e-3, min_lr=1.2e-4, warmup_portion=0.1, weight_decay=1e-4,
+    checkpoint_dir, filename, max_epochs=10, max_lr=3.2e-3, min_lr=1.2e-4, warmup_portion=0.1, weight_decay=1e-4,
     setup_optimizer=False, loss='huber', stop_patience=5, stop_min_delta=1e-6, verbose=True, disable_tqdm=True,
+    fabric=None
 ):
     config= model.config
-    steps = len(train_loader) * epochs
+    steps = len(train_loader) * max_epochs
     warmup_steps= steps * warmup_portion
     max_steps= steps
 
@@ -267,99 +260,133 @@ def setup_trainer(
         criterion= nn.MSELoss(reduction='none')
     aux_criterion= LoadBalancingLoss(config.n_experts, config.top_k_experts, alpha=0.02)
 
-    trainer_obj= Trainer(
-        model, device, train_loader, scaler_obj, val_loader, test_loader, criterion, optimizer,
-        scheduler, aux_criterion, early_stopping, time_covariates, do_validation=True,
-        checkpointing=True, checkpoint_dir=checkpoint_dir, filename=filename, verbose=verbose,
-        disable_tqdm=disable_tqdm,
-    )
+    trainer_kwargs= {
+        "model": model, "device": device, "train_loader": train_loader, "train_ds_scaler": scaler_obj,
+        "val_loader": val_loader, "test_loader": test_loader, "criterion": criterion, "optimizer": optimizer,
+        "scheduler": scheduler, "aux_criterion": aux_criterion, "early_stopping": early_stopping,
+        "use_time_features": time_covariates, "do_validation": True,  "checkpointing": True,
+        "checkpoint_dir": checkpoint_dir, "filename": filename, "verbose": verbose, "disable_tqdm": disable_tqdm
+    }
+    if fabric is not None:
+        trainer_kwargs["fabric"]= fabric
+        TrainerClass= DTrainer
+    else:
+        TrainerClass= Trainer
+    trainer_obj= TrainerClass(**trainer_kwargs)
 
     return trainer_obj
 
 
-def main(device, use_fused, use_flashattn):
+def main():
+    device= 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device== 'cuda':
+        # TF32 computationally more efficient (slightly the same precision of FP32)
+        torch.set_float32_matmul_precision('high')
+        #torch.backends.cudnn.fp32_precision= 'tf32'
+
     args= build_parser().parse_args()
-    if args.seed is not None:
-        torch.manual_seed(int(args.seed))
     verbose= args.verbose
-    if verbose:
-        print(f"[INFO] Device: {device}; Using fused AdamW: {use_fused}; FlashAttention available: {use_flashattn}")
+    devices= max(args.devices, 1)
+    strategy= args.strategy
+    fabric= None
 
-    model_size= args.model_size
-    check_dir = args.checkpoint_dir
-    check_file= args.checkpoint_file
-    plot_file = args.plot_file
+    use_fused= False
+    use_flashattn= False
 
-    if model_size is None:  # when None, try to build a model from the checkpoint
-        ts_model, model_config= setup_model_from_checkpoint(check_file, check_dir, device, verbose)
-    else:
-        ts_model, model_config= setup_model(model_size, device, args)
-    if verbose:
-        count_parameters(ts_model)
+    try:
+        if strategy is not None:
+            # create the Fabric object before model, loaders, optimizer, or any early CUDA allocation
+            fabric= L.Fabric(
+                accelerator=device, devices=devices, num_nodes=max(args.num_nodes, 1), strategy=strategy,
+                precision=args.precision, plugins=args.plugins, callbacks=args.callbacks,
+            )
+            fabric.launch()
 
-    btc_size= args.batch_size
-    root_path= args.root_path
-    dataset_name= args.dataset_name
-    from_csv= args.from_csv
+        if args.seed is not None:
+            torch.manual_seed(int(args.seed))
+        if fabric is not None:
+            verbose= verbose if fabric.is_global_zero else False
 
-    (
-        train_loader, val_loader, tds_scaler,
-        test_loader_96, test_loader_192, test_loader_336, test_loader_720,
+        if device== 'cuda':
+            # enable flash attention
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cudnn.deterministic= True
+            # create AdamW optimizer and use the fused version of it is available
+            fused_available= 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            # fused is a lot faster when it is available and when running on cuda
+            use_fused= fused_available
+            use_flashattn= torch.backends.cuda.flash_sdp_enabled()
 
-    )= setup_data_loaders(
-        btc_size, root_path, dataset_name, from_csv, model_config.multi_modal, model_config.patch_width,
-        model_config.block_size, model_config.width_factor, model_config.is_causal
-    )
-    if verbose:
-        print(f"[INFO] {dataset_name} data -- number of batches (train, val, test-96): {len(train_loader)}, "
-              f"{len(val_loader)}, {len(test_loader_96)}")
+        if verbose:
+            print(f"[INFO] Device: {device}; Has fused AdamW: {use_fused}; FlashAttention available: {use_flashattn}")
 
-    epochs= args.epochs
-    max_lr= args.max_lr
-    min_lr= args.min_lr
-    warmup_portion= args.warmup_portion
-    weight_decay  = args.weight_decay
-    setup_opt= args.setup_opt
-    loss= args.loss
-    stop_patience = args.stop_patience
-    stop_min_delta= args.stop_min
-    disable_tqdm= not args.show_tqdm
+        model_size= args.model_size
+        check_dir = args.checkpoint_dir
+        check_file= args.checkpoint_file
+        plot_file = args.plot_file
 
-    trainer= setup_trainer(
-        ts_model, device, use_fused, train_loader, val_loader, test_loader_96, tds_scaler,
-        model_config.multi_modal, check_dir, check_file, epochs, max_lr, min_lr, warmup_portion,
-        weight_decay, setup_opt, loss, stop_patience, stop_min_delta, verbose, disable_tqdm
-    )
+        if model_size is None:  # when None, try to build a model from the checkpoint
+            ts_model, model_config= setup_model_from_checkpoint(check_file, check_dir, verbose)
+        else:
+            ts_model, model_config= setup_model(model_size, args)
 
-    use_bf16= args.bf16
-    clip_grad= args.clip_grad
-    moe_metrics= args.moe_metrics
-    do_train= args.train
-    do_test = args.test
-    save_plots= args.save_plots
-    cut_first= args.plot_cut_first
+        if fabric is None:
+            ts_model= ts_model.to(device)
+        if verbose:
+            count_parameters(ts_model)
 
-    if do_train:
-        trainer.train(epochs, use_bf16=use_bf16, clip_grad=clip_grad, get_moe_metrics=moe_metrics)
-        if save_plots:
-            trainer.plot_results(cut_first_epoch=cut_first, show_plot=False, save_charts=True, file_name=f"{plot_file}_losses")
-            trainer.plot_expert_routing_diagnostics(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_routing")
-            if model_config.n_experts <= 8:
-                trainer.plot_expert_usage_global(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_global")
-                trainer.plot_expert_usage_layerwise(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_layer")
-            else:
-                trainer.plot_expert_usage_global_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap")
-                trainer.plot_expert_usage_layerwise_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap_layer")
+        btc_size= args.batch_size
+        root_path= args.root_path
+        dataset_name= args.dataset_name
+        from_csv= args.from_csv
 
-    if do_test:
-        _, _= trainer.load_checkpoint(filename=None, checkpoint_dir=check_dir)
+        (
+            train_loader, val_loader, tds_scaler,
+            test_loader_96, test_loader_192, test_loader_336, test_loader_720,
 
-        avg_mse, avg_mae= eval_forecast_horizons(
-            ts_model, trainer, dataset_name, test_loader_96, test_loader_192, test_loader_336, test_loader_720
+        )= setup_data_loaders(
+            btc_size, root_path, dataset_name, from_csv, model_config.multi_modal, model_config.patch_width,
+            model_config.block_size, model_config.width_factor, model_config.is_causal
         )
         if verbose:
-            print(f"\nAverage MSE: {avg_mse:.4f}, Average MAE: {avg_mae:.4f}")
+            print(f"[INFO] {dataset_name} data -- number of batches (train, val, test-96): {len(train_loader)}, "
+                  f"{len(val_loader)}, {len(test_loader_96)}")
+
+        epochs= args.epochs
+        disable_tqdm= not args.show_tqdm
+
+        trainer= setup_trainer(
+            ts_model, device, use_fused, train_loader, val_loader, test_loader_96, tds_scaler, model_config.multi_modal,
+            check_dir, check_file, epochs, args.max_lr, args.min_lr, args.warmup_portion, args.weight_decay, args.setup_opt,
+            args.loss, args.stop_patience, args.stop_min, verbose, disable_tqdm, fabric
+        )
+
+        if args.train:
+            trainer.train(epochs, use_bf16=args.bf16, clip_grad=args.clip_grad, get_moe_metrics=args.moe_metrics)
+
+            if args.save_plots:
+                trainer.plot_results(cut_first_epoch=args.plot_cut_first, show_plot=False, save_charts=True, file_name=f"{plot_file}_losses")
+                trainer.plot_expert_routing_diagnostics(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_routing")
+                if model_config.n_experts <= 8:
+                    trainer.plot_expert_usage_global(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_global")
+                    trainer.plot_expert_usage_layerwise(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_layer")
+                else:
+                    trainer.plot_expert_usage_global_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap")
+                    trainer.plot_expert_usage_layerwise_heatmap(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_usage_heatmap_layer")
+
+        if args.test:
+            _, _= trainer.load_checkpoint(filename=None, checkpoint_dir=check_dir)
+
+            avg_mse, avg_mae= eval_forecast_horizons(
+                trainer, dataset_name, test_loader_96, test_loader_192, test_loader_336, test_loader_720
+            )
+            if verbose:
+                print(f"\nAverage MSE: {avg_mse:.4f}, Average MAE: {avg_mae:.4f}")
+
+    finally:
+        if (fabric is not None) and devices > 1:
+            dist.destroy_process_group()
 
 
 if __name__ == '__main__':
-    main(DEVICE, USE_FUSED, USE_FLASHATTN)
+    main()
