@@ -24,7 +24,7 @@ def load_data(name, unique_id=None):
     # name in {'ettm1','ettm2','etth1','etth2'}
     if name == 'ettm1':
         # ETT data contains several different transformer units; each gets its own unique_id
-        # Y_df: unique_id, ds, y, where y is the (scaled) values of each serie
+        # Y_df: unique_id, ds, y, where y is the (scaled) values of each series
         # X_df: unique_id, ds, ex_1, ..., ex_4, where these are calendar (exogenous) covariates
         Y_df, X_df, *_= LongHorizon.load(directory='./', group='ETTm1')
     elif name == 'ettm2':
@@ -179,8 +179,8 @@ class Dataset_ETT(Dataset):
             data= df_data.values
 
         # build time‐stamp features
-        df_stamp= df_raw[['date']][border1:border2]
-        dt= pd.to_datetime(df_stamp['date'])
+        df_stamp= df_raw.loc[border1:border2, ['date']].copy()
+        dt:pd.Series= pd.to_datetime(df_stamp['date'])
         if self.timeenc == 0:
             df_stamp['month']  = dt.dt.month
             df_stamp['day']    = dt.dt.day
@@ -218,9 +218,9 @@ class Dataset_ETT(Dataset):
             seq_x_mark= torch.from_numpy(self.data_stamp[s_begin:s_end]).permute(1, 0).float()
             seq_y_mark= torch.from_numpy(self.data_stamp[r_begin:r_end]).permute(1, 0).float()
 
-            return seq_x, seq_y, seq_x_mark, seq_y_mark
+            return seq_x, seq_y, seq_x_mark, seq_y_mark, index
         else:
-            return seq_x, seq_y
+            return seq_x, seq_y, index
 
 
     def __len__(self):
@@ -321,8 +321,8 @@ class Dataset_Custom(Dataset):
             data= df_data.values
 
         # build time‐stamp features
-        df_stamp= df_raw[['date']][border1:border2]
-        dt= pd.to_datetime(df_stamp['date'])
+        df_stamp= df_raw.loc[border1:border2, ['date']].copy()
+        dt:pd.Series= pd.to_datetime(df_stamp['date'])
         if self.timeenc == 0:
             df_stamp['month']  = dt.dt.month
             df_stamp['day']    = dt.dt.day
@@ -360,9 +360,9 @@ class Dataset_Custom(Dataset):
             seq_x_mark= torch.from_numpy(self.data_stamp[s_begin:s_end]).permute(1, 0).float()
             seq_y_mark= torch.from_numpy(self.data_stamp[r_begin:r_end]).permute(1, 0).float()
 
-            return seq_x, seq_y, seq_x_mark, seq_y_mark
+            return seq_x, seq_y, seq_x_mark, seq_y_mark, index
         else:
-            return seq_x, seq_y
+            return seq_x, seq_y, index
 
 
     def __len__(self):
@@ -493,7 +493,7 @@ class Dataset_GlobalTemp(Dataset):
 
         # build time‐stamp features
         df_stamp= pd.DataFrame(data=raw_time, columns=['date'])
-        dt= pd.to_datetime(df_stamp['date'])
+        dt:pd.Series= pd.to_datetime(df_stamp['date'])
         if self.timeenc == 0:
             # explicit integer fields per timestamp -> produce shape (T, n_time_feats)
             df_stamp['month']  = dt.dt.month
@@ -528,236 +528,10 @@ class Dataset_GlobalTemp(Dataset):
             seq_x_mark= torch.from_numpy(self.data_stamp[s_begin:s_end]).permute(1, 0).float()
             seq_y_mark= torch.from_numpy(self.data_stamp[r_begin:r_end]).permute(1, 0).float()
 
-            return seq_x, seq_y, seq_x_mark, seq_y_mark
+            return seq_x, seq_y, seq_x_mark, seq_y_mark, index
         else:
-            return seq_x, seq_y
+            return seq_x, seq_y, index
 
 
     def __len__(self):
         return len(self.data_x) - self.seq_len - self.pred_len + 1
-
-
-
-class SlidingWindowMultivariate(Dataset):
-    """
-    Given a (T x D) pandas DataFrame, build multivariate sliding-window supervised examples.
-    Splits the last 'val_size' windows for validation, last 'test_size' for testing,
-    and uses the rest for training.
-    """
-
-    def __init__(self, data, input_width, history_tail, output_width, covariate_cols, target_col,
-                 val_size, test_size, split="train", scale=True, scaler=None) -> None:
-        assert split in ("train", "val", "test")
-        self.split= split
-        self.input_width = input_width
-        self.history_tail= history_tail
-        self.output_width= output_width
-
-        all_cols= covariate_cols + [target_col]
-        arr= data[all_cols].values.astype(np.float32)  # (T, dim)
-        T, dim= arr.shape
-
-        # how many siding window
-        window   = input_width + output_width
-        n_windows= T - window + 1
-        # cutoff between train / eval in terms of windows
-        train_end= n_windows - (val_size + test_size)
-        val_end  = n_windows - test_size
-
-        # fit / apply the scaler before windowing
-        if scale and split.lower()== 'train':
-            # fit only on all time‐steps that appear in any train window
-            # the raw training portion extends through the last window's end
-            train_slice= arr[: train_end + window]
-            self.scaler= StandardScaler()
-            self.scaler.fit(train_slice)
-            # transform the entire array so that both train/val/test are on the same scale
-            arr= self.scaler.transform(arr)
-        elif scale:
-            # val / test must be given an existing scaler
-            assert scaler is not None, "Scaler must be provided for val/test splits"
-            self.scaler= scaler
-            # transform the entire array so that both train/val/test are on the same scale
-            arr= self.scaler.transform(arr)
-        else:
-            self.scaler= None
-
-        # build the raw sliding‐window view
-        X= np.lib.stride_tricks.sliding_window_view(arr, window_shape=(window, dim))
-        # here X has shape (n_windows, 1, window, dim)
-        X= X.squeeze(1)
-        # now X has shape  (n_windows, window, dim)
-
-        # split into X_all and Y_all
-        X_all= X[:, :input_width, :]  # (n_windows, input_width, dim)
-        Y_all= X[:, input_width:, :]  # (n_windows, output_width, dim)
-
-        # select only the windows belonging to the requested split
-        if split.lower()== 'train':
-            idx= slice(0, train_end)
-        elif split.lower()== 'val':
-            idx= slice(train_end, val_end)
-        else:  # test
-            idx= slice(val_end, n_windows)
-
-        # convert to tensors from (B, T, dim) format to (B, dim, T)
-        # inputs shape:  (B, T, dim) -> permute -> (B, dim, T)
-        self.inputs = (torch.from_numpy(X_all[idx].copy())).permute(0, 2, 1).float()
-        # targets shape: (B, H, dim) -> permute -> (B, dim, H)
-        self.targets= (torch.from_numpy(Y_all[idx].copy())).permute(0, 2, 1).float()
-        self.length= self.inputs.shape[0]
-
-
-    def __len__(self):
-        return self.length
-
-
-    def __getitem__(self, idx):
-        """
-        RETURNS: A tuple with data and its targets.
-        """
-        x, y_future= self.inputs[idx], self.targets[idx]
-
-        if self.history_tail:
-            # grab the "history tail" of x along time:
-            y_history= x[:, -self.history_tail:]
-            y_full= torch.cat([y_history, y_future], dim=1)
-
-            return x, y_full
-
-        return x, y_future
-
-
-    def inverse_transform(self, arr:np.ndarray) -> np.ndarray:
-        """
-        Invert standardization.
-        - 'arr' should be shape (n_samples, n_features).
-        """
-        assert self.scaler is not None, "Scaler was not provided"
-        return self.scaler.inverse_transform(arr)
-
-
-
-class SlidingWindowDataset(Dataset):
-    """
-    Builds sliding-window supervised examples (X, y) from a wide-format ETT dataframe.
-    Splits the last 'val_size' windows for validation, last 'test_size' for testing,
-    and uses the rest for training.
-    """
-
-    def __init__(self, data, input_width, history_tail, output_width, covariate_cols, target_col,
-                 val_size, test_size, split="train", scale=True, scaler=None) -> None:
-        assert split in ("train", "val", "test")
-        self.split= split
-        self.input_width = input_width
-        self.history_tail= history_tail
-        self.output_width= output_width
-
-        size= len(data)
-        # fit / apply the scaler before windowing
-        train_end= size - (val_size + test_size)
-        df_train = data.iloc[:train_end].copy()
-        df_eval  = data.iloc[train_end:].copy()
-
-        all_cols= covariate_cols + [target_col]
-        if scale and split.lower()== 'train':
-            # fit a new scaler on training data only
-            self.scaler= StandardScaler()
-            arr_train= df_train[all_cols].to_numpy()
-            self.scaler.fit(arr_train)
-            # transform df_train in-place
-            df_train.loc[:, all_cols]= self.scaler.transform(arr_train)
-        elif scale:
-            # for val / test must be given a pre-fitted scaler
-            assert scaler is not None, "Scaler must be provided for val/test"
-            self.scaler= scaler
-
-            df_val = df_eval.iloc[:val_size].copy()
-            df_test= df_eval.iloc[val_size:].copy()
-
-            if split.lower()== 'val':
-                arr_val= df_val[all_cols].to_numpy()
-                # transform df_val in-place
-                df_val.loc[:, all_cols]= self.scaler.transform(arr_val)
-            else:  # split.lower()== 'test'
-                arr_test= df_test[all_cols].to_numpy()
-                # transform df_test in-place
-                df_test.loc[:, all_cols]= self.scaler.transform(arr_test)
-
-            # re‐assemble the eval scaled data
-            df_eval= pd.concat([df_val, df_test], ignore_index=True)
-        else:
-            self.scaler= None
-
-        # re‐assemble the full scaled data for windowing:
-        data_full= pd.concat([df_train, df_eval], ignore_index=True)
-        # build sliding windows after scaling
-        X_windows= []
-        Y_windows= []
-
-        # (1) define X and y
-        if covariate_cols:
-            covs= data_full[covariate_cols].to_numpy(dtype=np.float32)
-        else:
-            # when handling a single-dimensional dataset
-            covs= data_full[[target_col]].to_numpy(dtype=np.float32)
-        target= data_full[[target_col]].to_numpy(dtype=np.float32)
-
-        # build siding window
-        window= input_width + output_width
-        last_start= size - window + 1
-        for t0 in range(0, last_start):
-            y_end= t0 + window - 1
-
-            # decide whether this window belongs to train/val/test
-            if split.lower()== 'train':
-                if y_end >= size - val_size - test_size:
-                    continue
-            elif split.lower()== 'val':
-                if not (size - val_size - test_size <= y_end < size - test_size):
-                    continue
-            else:  # test
-                if y_end < size - test_size:
-                    continue
-
-            x= covs[t0 : t0+input_width]
-            # split history vs future
-            y_hist  = target[t0+input_width- history_tail : t0+input_width].squeeze(-1)
-            y_future= target[t0+input_width               : t0+input_width+output_width].squeeze(-1)
-
-            if history_tail:
-                y= np.concatenate([y_hist, y_future])
-            else:
-                y= y_future
-
-            X_windows.append(x)
-            Y_windows.append(y)
-
-        # (2) stack into numpy arrays -- more efficient than directly convert to tensor
-        X_np= np.stack(X_windows, axis=0)
-        Y_np= np.stack(Y_windows, axis=0)
-
-        # (3) convert to tensors and permute inputs to (B, channels/features, seq_length)
-        self.inputs= (torch.from_numpy(X_np)).permute(0, 2, 1)
-        self.targets= torch.from_numpy(Y_np)
-        self.length= self.inputs.size(0)
-
-
-    def __len__(self):
-        return self.length
-
-
-    def __getitem__(self, idx):
-        """
-        RETURNS: A tuple with data and its targets.
-        """
-        return self.inputs[idx], self.targets[idx]
-
-
-    def inverse_transform(self, arr:np.ndarray) -> np.ndarray:
-        """
-        Invert standardization.
-        - 'arr' should be shape (n_samples, n_features).
-        """
-        assert self.scaler is not None, "Scaler was not provided"
-        return self.scaler.inverse_transform(arr)
