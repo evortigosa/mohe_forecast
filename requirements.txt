@@ -1,9 +1,10 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+tqdm
 einops==0.8.2
-matplotlib==3.10.0
-numpy==2.0.2
-pandas==2.2.2
-scikit-learn==1.6.1
 timm==1.0.24
-torch==2.9.0+cu128
-tqdm==4.67.3
+torch==2.9.0
+lightning==2.6.4
 datasetsforecast==1.0.0
