@@ -23,7 +23,7 @@ class MultiOptimizer:
     parameter-group dictionaries owned by the internal optimizers. Therefore, code such as:
         optimizer.param_groups[0]["lr"]= new_lr
     modifies the actual internal optimizer group, preserving compatibility with custom learning-rate
-    schedulers that directly read or write 'optimizer.param_groups".
+    schedulers that directly read or write 'optimizer.param_groups'.
     """
 
     def __init__(self, **optimizers):

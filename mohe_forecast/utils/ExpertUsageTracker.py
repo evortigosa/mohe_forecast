@@ -256,7 +256,7 @@ class ExpertUsageTracker:
     def to_serializable(self, compact:bool=False) -> Dict[str, Any]:
         """
         Return a checkpoint-safe representation of the tracker.
-        - compact (bool): If True, removes step-level histories to reduce checkpoint size. Epch
+        - compact (bool): If True, removes step-level histories to reduce checkpoint size. Epoch
         histories and current epoch accumulators are preserved.
         """
         global_step_history= copy.deepcopy(self.global_step_history)

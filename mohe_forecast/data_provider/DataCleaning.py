@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts (MoHE)
-Data-cleaning Pipline
+Data-cleaning Pipeline
 """
 
 import numpy as np
@@ -10,7 +10,7 @@ import numpy as np
 
 class DataCleaning:
     """
-    Utility Data-cleaning Pipline
+    Utility Data-cleaning Pipeline
     Adapted from https://arxiv.org/abs/2409.16040
     """
 
