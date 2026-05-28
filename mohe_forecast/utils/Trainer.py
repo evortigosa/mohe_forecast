@@ -61,6 +61,90 @@ class Trainer:
         self._log= self._build_logger(f"{self.__class__.__name__}")
 
 
+    def _set_model(self):
+        """ Helper. Set the model on device. """
+        if getattr(self, "model", None) is not None:
+            self.model= self.model.to(self.device)
+
+
+    def _set_optimizer(self):
+        """ Helper. Set the optimizer on device. """
+        if getattr(self, "optimizer", None) is None:
+            return
+
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key]= value.to(self.device)
+
+
+    def _set_loader(self, loader):
+        """ Helper. Just return loader. """
+        return loader
+
+
+    def _move_to_device(self, x):
+        """ Helper. Return a tensor on device. """
+        if isinstance(x, torch.Tensor):
+            return x.to(self.device)
+        return x
+
+
+    def _unwrap_model(self):
+        """ Helper to ensure compatibility with distributed training. """
+        return self.model
+
+
+    def _is_main_process(self) -> bool:
+        """ Helper to ensure compatibility with distributed training. """
+        return True
+
+
+    def _barrier(self):
+        """ Helper to ensure compatibility with distributed training. """
+        pass
+
+
+    def _print(self, *args, **kwargs):
+        """ Helper to ensure compatibility with distributed training. """
+        print(*args, **kwargs)
+
+
+    def _reduce_sum(self, x:torch.Tensor) -> torch.Tensor:
+        """ Helper to ensure compatibility with distributed training. """
+        return x
+
+
+    def _gather_variable_batch(self, x:torch.Tensor) -> torch.Tensor:
+        """ Helper to ensure compatibility with distributed training. """
+        return x
+
+
+    def _backward(self, loss, clip_grad=None):
+        """
+        Helper to ensure compatibility with distributed training.
+        Runs a backward pass to get the gradients with (optional) clip_grad_norm_.
+        """
+        loss.backward()
+        if clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_grad)
+
+
+    def _reduce_moe_metrics(self, metrics):
+        """ Helper to ensure compatibility with distributed training. """
+        return metrics
+
+
+    def _save(self, state_file, state_path):
+        """ Helper. Just save state_file at state_path. """
+        torch.save(state_file, state_path)
+
+
+    def _load(self, state_path, map_location="cpu", weights_only=True):
+        """ Helper. Just load and return a file from state_path. """
+        return torch.load(state_path, map_location=map_location, weights_only=weights_only)
+
+
     def get_checkpoint_path(self, filename:str, checkpoint_dir:str) -> str:
         """
         Return the path to the checkpoint file.
@@ -110,6 +194,9 @@ class Trainer:
         """
         Set a log entry. log_type can be "info", "warning", or "error".
         """
+        if not self._is_main_process():
+            return
+
         if log_type.lower() == "warning" or log_type.lower() == "error":
             self._log.warning(message)
             log_type= f"[{log_type.upper()}]"
@@ -146,94 +233,134 @@ class Trainer:
 
     def _get_cuda_memory_stats(self) -> float:
         """
-        Return the maximum peak GPU memory usage in GB.
+        Return the maximum peak GPU memory usage in GB (sum across ranks).
         """
         if self.device.type == 'cuda':
             torch.cuda.synchronize(self.device)
             peak_vram= torch.cuda.max_memory_allocated(self.device)/1024**3
-            return peak_vram
+            peak_vram= torch.tensor(peak_vram, device=self.device)
+            peak_vram= self._reduce_sum(peak_vram)
+            return float(peak_vram.item())
 
         return 0.
 
 
-    @staticmethod
-    def _get_minibatch(batch, use_time_features:bool):
+    def _get_minibatch(self, batch, do_augmentation=False, return_index=False):
         """
         Minibatch construction from a DataLoader batch.
         """
-        if use_time_features:
-            data, target, data_time, target_time= batch
+        sample_index= None
+
+        if self.use_time_features:
+            if len(batch) == 5:
+                data, target, data_time, target_time, sample_index= batch
+            elif len(batch) == 4:
+                data, target, data_time, target_time= batch
+            else:
+                raise ValueError(f"Unexpected batch length with time features: {len(batch)}")
         else:
-            data, target= batch
+            if len(batch) == 3:
+                data, target, sample_index= batch
+            elif len(batch) == 2:
+                data, target= batch
+            else:
+                raise ValueError(f"Unexpected batch length without time features: {len(batch)}")
             data_time  = None
             target_time= None
 
-        return data, target, data_time, target_time
+        if do_augmentation and self.augmentation is not None:
+            data= self.augmentation(data)
+
+        data, target= self._move_to_device(data), self._move_to_device(target)
+        data_time, target_time= self._move_to_device(data_time), self._move_to_device(target_time)
+
+        if not return_index:
+            return data, target, data_time, target_time
+
+        if sample_index is None:
+            raise RuntimeError("Distributed test requires sample indices, but the dataset did not return them.")
+        return data, target, data_time, target_time, self._move_to_device(sample_index)
+
+
+    def set_forecast_horizon(self, horizon:int):
+        """ Helper to ensure a correct setting of n_outputs (forecast_horizon). """
+        model= self._unwrap_model()
+        if hasattr(model, "n_outputs"):
+            model.n_outputs= horizon
 
 
     @torch.inference_mode()
-    def test(self, test_loader=None, test_criterion=nn.MSELoss(reduction='none'), inverse_transform=False):
+    def test(self, test_loader=None, inverse_transform=False):
         """
-        Test the model on a test set.
-        Returns the mean test loss, test predictions, and test labels.
+        Test the model on a test set. Safe for uneven last batches and correct under distributed sampler padding.
+        Returns test predictions and test labels.
         """
-        test_loader= self.test_loader if test_loader is None else test_loader
+        test_loader= self.test_loader if test_loader is None else self._set_loader(test_loader)
         assert test_loader is not None, "test_loader cannot refer to None"
-
         self.model.eval()
-        test_criterion= test_criterion if test_criterion is not None else self.criterion
-        test_loss= 0.0
-        n_samples= 0
-        all_logits, all_trues= [], []
+        # all logits and trues to feed external metrics
+        all_logits, all_trues, all_indices= [], [], []
 
-        if self.train_ds_scaler is not None:
-            inverse_transform= inverse_transform
-            scale_= torch.from_numpy(self.train_ds_scaler.scale_).float().view(1,-1,1).to(self.device)
-            mean_ = torch.from_numpy(self.train_ds_scaler.mean_).float().view(1,-1,1).to(self.device)
+        if self.train_ds_scaler is not None and inverse_transform:
+            scale_= self._move_to_device(torch.from_numpy(self.train_ds_scaler.scale_).float().view(1, -1, 1))
+            mean_ = self._move_to_device(torch.from_numpy(self.train_ds_scaler.mean_).float().view(1, -1, 1))
         else:
             inverse_transform= False
-            scale_= 1.
-            mean_ = 0.
+            scale_= 1.0
+            mean_ = 0.0
 
         start= time.time()
+        p_bar= self.disable_tqdm or not self._is_main_process()
         self._reset_cuda_memory_stats(empty_cache=True, reset_peak_memory=True)
+        model_ref= self._unwrap_model()
 
-        for batch in tqdm(test_loader, desc='Testing', disable=self.disable_tqdm):
+        for batch in tqdm(test_loader, desc='Testing', disable=p_bar):
             # --- minibatch construction ---
-            data, target, data_time, target_time= self._get_minibatch(batch, self.use_time_features)
-            data, target= data.to(self.device), target.to(self.device)
-            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
-            target_time= target_time.to(self.device) if isinstance(target_time, torch.Tensor) else None
+            data, target, data_time, target_time, sample_index= self._get_minibatch(batch, return_index=True)
 
-            # --- forward pass and get loss ---
-            if self.model.forecasting:
-                logits= self.model.forecast(data, ts_mark=data_time, ts_mark_future=target_time)
+            # --- forward pass and get logits ---
+            if getattr(model_ref, "forecasting", False):
+                logits= model_ref.forecast(data, ts_mark=data_time, ts_mark_future=target_time)
                 if inverse_transform:
                     # invert the scaling back to the original units
                     logits= logits * scale_ + mean_
                     target= target * scale_ + mean_
             else:
                 logits, *_= self.model(data, ts_mark=data_time)
-            losses= test_criterion(logits, target)
-            loss= torch.mean(losses)
 
-            # --- register preds and trues ---
-            test_loss += float(loss.item()) * data.size(0)
-            n_samples += data.size(0)
-            all_logits.append(logits.cpu())
-            all_trues.append(target.cpu())
-
-        test_loss= test_loss / n_samples
+            logits_store= self._gather_variable_batch(logits.detach())
+            target_store= self._gather_variable_batch(target.detach())
+            index_store = self._gather_variable_batch(sample_index.detach().view(-1))
+            if self._is_main_process():
+                all_logits.append(logits_store.float().cpu())
+                all_trues.append(target_store.float().cpu())
+                all_indices.append(index_store.cpu())
 
         peak_vram= self._get_cuda_memory_stats()
         end= time.time()
         dt = self._format_dt(end - start)
-        self._set_log(
-            "info", f"test | test_loss=%.6f | loss type=%s | peak GPU mem=%.2fGB | dt=%sms" % \
-             (test_loss, f'{test_criterion}', peak_vram, dt)
-        )
+        self._set_log("info", f"test | max GPU mem=%.2fGB | dt=%sms" % (peak_vram, dt),)
 
-        return test_loss, torch.cat(all_logits, dim=0), torch.cat(all_trues, dim=0)
+        if not self._is_main_process():
+            return None, None
+        if len(all_logits) == 0:
+            raise RuntimeError("No predictions were collected during test().")
+
+        preds= torch.cat(all_logits, dim=0)
+        trues= torch.cat(all_trues, dim=0)
+        indices= torch.cat(all_indices, dim=0).long()
+        # gather sample indices too, then sort and deduplicate (may happen in distributed evaluations)
+        order= torch.argsort(indices)
+        indices= indices[order]
+        preds= preds[order]
+        trues= trues[order]
+        # deduplicate preds and trues
+        keep= torch.ones_like(indices, dtype=torch.bool)
+        keep[1:]= indices[1:] != indices[:-1]
+        preds= preds[keep]
+        trues= trues[keep]
+
+        return preds, trues
 
 
     @torch.inference_mode()
@@ -243,26 +370,27 @@ class Trainer:
         """
         self.model.eval()
         val_criterion= val_criterion if val_criterion is not None else self.criterion
-        val_loss= 0.0
-        n_samples= 0
+        val_loss= torch.tensor(0.0, device=self.device)
+        n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
+        p_bar= self.disable_tqdm or not self._is_main_process()
 
-        for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
+        for batch in tqdm(self.val_loader, desc='Validating', disable=p_bar):
             # --- minibatch construction ---
-            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
-            data, target= data.to(self.device), target.to(self.device)
-            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
+            data, target, data_time, *_= self._get_minibatch(batch)
 
             # --- forward pass and get loss ---
             logits, *_= self.model(data, ts_mark=data_time)
             losses= val_criterion(logits, target)
             loss= torch.mean(losses)
 
-            val_loss += float(loss.item()) * data.size(0)
+            val_loss += loss.detach() * data.size(0)
             n_samples+= data.size(0)
 
-        val_loss= val_loss / n_samples
+        val_loss = self._reduce_sum(val_loss)
+        n_samples= self._reduce_sum(n_samples)
+        val_loss= val_loss / n_samples.clamp_min(1)
 
-        return val_loss
+        return float(val_loss.item())
 
 
     @torch.inference_mode()
@@ -279,9 +407,7 @@ class Trainer:
 
         for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
             # --- minibatch construction ---
-            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
-            data, target= data.to(self.device), target.to(self.device)
-            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
+            data, target, data_time, *_= self._get_minibatch(batch)
 
             # --- forward pass and get loss ---
             # model defined as usual; model parameters kept as float32
@@ -293,7 +419,7 @@ class Trainer:
                 val_loss += float(loss.item()) * data.size(0)
                 n_samples+= data.size(0)
 
-        val_loss= val_loss / n_samples
+        val_loss= val_loss / max(n_samples, 1)
 
         return val_loss
 
@@ -303,22 +429,19 @@ class Trainer:
         Train the model for one epoch, returning the training loss and learning rate.
         """
         self.model.train()
-        train_loss= 0.0
-        n_samples= 0
+        train_loss= torch.tensor(0.0, device=self.device)
+        n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
         n_steps= 0
         epoch_lr= 0.0
+        p_bar= self.disable_tqdm or not self._is_main_process()
 
         # --- training steps ---
-        for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}", disable=self.disable_tqdm):
+        for batch in tqdm(self.train_loader, desc=f"Training epoch {epoch}", disable=p_bar):
             self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
-            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
-            data, target= data.to(self.device), target.to(self.device)
-            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
+            data, target, data_time, *_= self._get_minibatch(batch)
             padding_mask= None
-            if self.augmentation is not None:
-                data= (self.augmentation(data)).to(self.device)
 
             # --- forward pass and get loss ---
             logits, router_probs, *_= self.model(data, ts_mark=data_time)
@@ -326,7 +449,7 @@ class Trainer:
             losses= self.criterion(logits, target)
             loss= torch.mean(losses)
             # sample‑weighted average loss
-            train_loss += float(loss.item()) * data.size(0)
+            train_loss += loss.detach() * data.size(0)
             n_samples += data.size(0)
 
             if self.aux_criterion is not None:
@@ -335,7 +458,9 @@ class Trainer:
                 )
                 loss= loss + aux_loss
 
-                if get_moe_metrics and self.expert_traker is not None:
+                if get_moe_metrics and (self.expert_traker is not None):
+                    global_metrics= self._reduce_moe_metrics(global_metrics)
+                    layer_metrics = self._reduce_moe_metrics(layer_metrics)
                     self.expert_traker.update(global_metrics, layer_metrics)
 
             # check loss finite
@@ -347,9 +472,7 @@ class Trainer:
                 raise FloatingPointError(f"Non-finite loss encountered at epoch {epoch}: {loss.detach().cpu()}")
 
             # --- backward pass to calculate the gradients ---
-            loss.backward()
-            if clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_grad)
+            self._backward(loss, clip_grad)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
@@ -363,10 +486,12 @@ class Trainer:
         if self.augmentation is not None:
             self.augmentation.step_epoch()
 
-        train_loss= train_loss / n_samples
+        train_loss= self._reduce_sum(train_loss)
+        n_samples = self._reduce_sum(n_samples)
+        train_loss= train_loss / n_samples.clamp_min(1)
         epoch_lr  = epoch_lr / n_steps
 
-        return train_loss, epoch_lr
+        return float(train_loss.item()), epoch_lr
 
 
     def train_one_epoch_bf16(self, epoch, clip_grad=None, get_moe_metrics=False):
@@ -386,12 +511,8 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             # --- minibatch construction ---
-            data, target, data_time, _= self._get_minibatch(batch, self.use_time_features)
-            data, target= data.to(self.device), target.to(self.device)
-            data_time= data_time.to(self.device) if isinstance(data_time, torch.Tensor) else None
+            data, target, data_time, *_= self._get_minibatch(batch)
             padding_mask= None
-            if self.augmentation is not None:
-                data= (self.augmentation(data)).to(self.device)
 
             # --- forward pass and get loss ---
             # model, optimizer defined as usual; model parameters kept as float32
@@ -410,7 +531,7 @@ class Trainer:
                     )
                     loss= loss + aux_loss
 
-                    if get_moe_metrics and self.expert_traker is not None:
+                    if get_moe_metrics and (self.expert_traker is not None):
                         self.expert_traker.update(global_metrics, layer_metrics)
 
             # check loss finite
@@ -424,9 +545,7 @@ class Trainer:
             # --- backward pass to calculate the gradients ---
             # gradients computed in BF16, but accumulation and params remain TF32
             # BF16 does not need loss scaling with torch.amp.GradScaler()
-            loss.backward()
-            if clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_grad)
+            self._backward(loss, clip_grad)
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
@@ -441,7 +560,7 @@ class Trainer:
             self.augmentation.step_epoch()
 
         train_loss= train_loss / n_samples
-        epoch_lr  = epoch_lr / n_steps
+        epoch_lr  = epoch_lr / max(n_steps, 1)
 
         return train_loss, epoch_lr
 
@@ -453,13 +572,14 @@ class Trainer:
         train_info= f'use_bf16={use_bf16}, clip_grad={clip_grad}, get_moe_metrics={get_moe_metrics}'
         opt_info  = f'weight_decay={self.optimizer.param_groups[0]["weight_decay"]:.2e}, betas={self.optimizer.param_groups[0]["betas"]}'
         scheduler_info= self.scheduler.extra_repr() if self.scheduler is not None else "N/A"
-        model_info= f'model full config: {self.model.config}'
+        m_config= getattr(self._unwrap_model(), "config", None)
+        model_info= f'model full config: {m_config}'
         self._set_log("info", f"train | {train_info} | optimizer info: {opt_info} | scheduler info: {scheduler_info} | {model_info}")
 
         self._reset_cuda_memory_stats(empty_cache=True)
 
         if get_moe_metrics and self.expert_traker is None:
-            self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
+            self.expert_traker= ExpertUsageTracker(m_config.n_experts, m_config.n_layer)
 
         best_val_loss= float('inf')
         best_epoch= -1
@@ -476,7 +596,7 @@ class Trainer:
             if self.augmentation is not None:
                 self.augmentation.set_epoch(epoch)
 
-            if use_bf16:
+            if use_bf16 is True:
                 train_loss, epoch_lr= self.train_one_epoch_bf16(epoch+1, clip_grad, get_moe_metrics)
             else:
                 train_loss, epoch_lr= self.train_one_epoch(epoch+1, clip_grad, get_moe_metrics)
@@ -484,7 +604,7 @@ class Trainer:
             self.lr_hist.append(epoch_lr)
 
             if self.do_validation and (epoch % eval_interval == 0 or epoch == epochs-1):
-                if use_bf16:
+                if use_bf16 is True:
                     val_loss= self.validate_bf16()
                 else:
                     val_loss= self.validate()
@@ -501,7 +621,7 @@ class Trainer:
             dt = self._format_dt(end - start)
             val_loss_log= f'{val_loss:.6f}' if did_validation else 'N/A'  # did_validation is False
             self._set_log("info",
-                f"train | epoch=%d/%d | train_loss=%.6f | val_loss=%s | lr=%.4e | peak GPU mem=%.2fGB | dt=%sms" % \
+                f"train | epoch=%d/%d | train_loss=%.6f | val_loss=%s | lr=%.4e | max GPU mem=%.2fGB | dt=%sms" % \
                 (epoch+1, epochs, train_loss, val_loss_log, epoch_lr, peak_vram, dt)
             )
 
@@ -550,11 +670,11 @@ class Trainer:
             'timestamp': time.time(),
         }
         try:
-            torch.save(checkpoint, checkpoint_path)
+            self._save(checkpoint, checkpoint_path)
             # (optional) save full expert tracker history in a separate file
             if self.expert_traker is not None:
                 traker_path= self.get_checkpoint_path(f'{self.filename}_expert_traker.pt', self.checkpoint_dir)
-                torch.save(self.expert_traker.state_dict(), traker_path)
+                self._save(self.expert_traker.state_dict(), traker_path)
             self._set_log(
                 "info", f"save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s" % \
                  (epoch+1, best_val_loss, checkpoint_path)
@@ -577,13 +697,11 @@ class Trainer:
         return state_dict
 
 
-    def load_checkpoint(self, filename=None, checkpoint_dir=None, restore_optimizer=False,
-                        restore_metadata=False) -> tuple:
+    def load_checkpoint(self, filename=None, checkpoint_dir=None, restore_optimizer=False, restore_metadata=False) -> tuple:
         """
         This method loads the checkpoint from the given path and restores the model, optimizer
         (optional, when restore_optimizer=True), and training history (optional, when restore_metadata=True).
         - restore expert tracker (optional): expected traker_path is {checkpoint_path}_expert_traker.pt
-        - TODO: Fix dtype, device, and layout for optimizer state loading.
         """
         checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
 
@@ -596,20 +714,25 @@ class Trainer:
             raise RuntimeError("self.model is None: instantiate model before restoring state_dict")
 
         try:
-            checkpoint= torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-            # restore model state
-            self.model.load_state_dict(self._strip_module_prefix(checkpoint['model_state_dict']))
+            checkpoint= self._load(checkpoint_path, map_location='cpu', weights_only=True)
+            # restore model state into the real underlying module
+            model= self._unwrap_model()
+            model.load_state_dict(self._strip_module_prefix(checkpoint['model_state_dict']))
             # ensure model on target device
-            if getattr(self, 'model', None) is not None:
-                self.model.to(self.device)
+            self._set_model()
             # restore optimizer state
             if restore_optimizer:
                 if getattr(self, "optimizer", None) is None:
                     self._set_log("warning",
-                        "load_checkpoint | restore_optimizer=True but self.optimizer is None: skipping optimizer restore."
+                        "load_checkpoint | restore_optimizer=True but self.optimizer is None: skipping optimizer."
+                    )
+                elif "optimizer_state_dict" not in checkpoint:
+                    self._set_log("warning",
+                        "load_checkpoint | restore_optimizer=True but optimizer_state_dict is missing: skipping optimizer."
                     )
                 else:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    self._set_optimizer()
                     if self.scheduler is not None:
                         self.scheduler.optimizer= self.optimizer
 
@@ -624,18 +747,26 @@ class Trainer:
                 self.lr_hist= checkpoint.get('lr_hist', [])
                 self.expert_traker= None
                 # load (optional) expert tracker history from a separate file
-                traker_path= f'{checkpoint_path[:-4]}_expert_traker.pt'
+                root_path, _= os.path.splitext(checkpoint_path)
+                traker_path= f'{root_path}_expert_traker.pt'
                 # load (optional) expert tracker history from the checkpoint file (old)
                 tracker= checkpoint.get('expert_traker', None)
 
                 if os.path.exists(traker_path) or tracker is not None:
                     if os.path.exists(traker_path):
-                        tracker= torch.load(traker_path, map_location="cpu", weights_only=True)
-                    self.expert_traker= ExpertUsageTracker(self.model.config.n_experts, self.model.config.n_layer)
-                    self.expert_traker.load_state_dict(tracker)
+                        tracker= self._load(traker_path, map_location="cpu", weights_only=True)
+                    m_config= getattr(model, "config", None)
+                    if m_config is None:
+                        self._set_log("warning",
+                            "load_checkpoint | Cannot restore expert_traker because model.config is missing."
+                        )
+                    else:
+                        self.expert_traker= ExpertUsageTracker(m_config.n_experts, m_config.n_layer)
+                        self.expert_traker.load_state_dict(tracker)
                 else:
                     self._set_log("warning", "load_checkpoint | No MoE usage history to load: skipping expert_traker restore.")
 
+            self._barrier()
             self._set_log("info",
                 "load_checkpoint | Checkpoint loaded from '%s'. Resuming training on '%s' with best validation loss of %.6f." % \
                 (checkpoint_path, _time, best_val_loss)
@@ -647,10 +778,10 @@ class Trainer:
             raise e
 
 
-    def build_model(self, filename=None, checkpoint_dir=None, restore_model=False, restore_optimizer=False,
-                    restore_metadata=False) -> tuple:
+    def build_model(self, filename=None, checkpoint_dir=None):
         """
-        Build a model from a given checkpoint.
+        Build and return a new model (on CPU) from a given checkpoint.
+        NOTE: This is a pre-setup method. It builds a fresh model before the distributed trainer wraps it.
         """
         checkpoint_path= self.get_checkpoint_path(filename, checkpoint_dir)
 
@@ -659,7 +790,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
         try:
-            checkpoint= torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+            checkpoint= self._load(checkpoint_path, map_location='cpu', weights_only=True)
             if 'config' not in checkpoint:
                 self._set_log("error", f"build_model | Checkpoint does not contain a 'config' key")
                 raise KeyError("Checkpoint does not contain a 'config' key to build the model")
@@ -670,15 +801,9 @@ class Trainer:
                 raise TypeError("checkpoint['config'] should be a dict of constructor kwargs")
 
             self._set_log("info", f"build_model | Building a new model with config: {config_args}")
-            self.model= TSFTransformer(**config_args).to(self.device)
+            model= TSFTransformer(**config_args)
 
-            epoch= 0
-            best_val_loss= 0.0
-            if restore_model:  # restore model state
-                epoch, best_val_loss= self.load_checkpoint(
-                    filename, checkpoint_dir, restore_optimizer, restore_metadata
-                )
-            return self.model, epoch, best_val_loss
+            return model
 
         except Exception as e:
             self._set_log("error", f"build_model | Failed to build and load checkpoint from {checkpoint_path}: {e}")
