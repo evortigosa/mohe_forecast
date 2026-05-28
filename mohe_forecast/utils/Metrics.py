@@ -81,11 +81,20 @@ class MAEMetric(SumEvaluationMetric):
 
 
 
-def get_metrics(trainer_class, test_loader):
+def get_metrics(trainer_obj, test_loader):
     """
     Build metric objects from full predictions and ground-truth tensors.
+    In distributed mode:
+    - all ranks call trainer_obj.test(...);
+    - only the main rank receives/uses full preds and trues;
+    - non-main ranks return (None, None).
     """
-    mean_loss, preds, trues= trainer_class.test(test_loader)
+    preds, trues= trainer_obj.test(test_loader)
+
+    if not trainer_obj._is_main_process():
+        return None, None
+    if preds is None or trues is None:
+        raise RuntimeError("Main process received None preds or labels from trainer.test().")
 
     mse_metric= MSEMetric(init_val=0.0)
     mae_metric= MAEMetric(init_val=0.0)
@@ -96,52 +105,43 @@ def get_metrics(trainer_class, test_loader):
 
 
 
-def eval_forecast_horizons(model, trainer, data_name, test_loader_96=None, test_loader_192=None,
+def eval_forecast_horizons(trainer_obj, data_name, test_loader_96=None, test_loader_192=None,
                            test_loader_336=None, test_loader_720=None):
     """
-    Evaluate multiple forecast horizons and return (avg_mse, avg_mae) across provided horizons.
-    Forecast horizons: {96, 192, 336, 720}
+    Evaluate multiple forecast horizons and return (avg_mse, avg_mae), i.e., {96, 192, 336, 720}
+    In distributed mode:
+    - all ranks execute the same horizon sequence;
+    - all ranks call test(), because test() uses distributed collectives;
+    - only the main rank prints and accumulates final metric values.
     """
     avg_mse= []
     avg_mae= []
 
-    print(data_name)
-    if test_loader_96 is not None:
-        print("Forecast horizon: 96")
-        model.n_outputs= 96
-        mse_metric, mae_metric= get_metrics(trainer, test_loader_96)
-        avg_mse.append(mse_metric.value)
-        avg_mae.append(mae_metric.value)
-        print(mse_metric)
-        print(mae_metric)
+    def eval_one_horizon(horizon, loader):
+        if loader is None:
+            return
+        # must happen on all ranks
+        trainer_obj._print(f"\nForecast horizon: {horizon}")
+        trainer_obj.set_forecast_horizon(horizon)
+        mse_metric, mae_metric= get_metrics(trainer_obj, loader)
 
-    if test_loader_192 is not None:
-        print("\nForecast horizon: 192")
-        model.n_outputs= 192
-        mse_metric, mae_metric= get_metrics(trainer, test_loader_192)
-        avg_mse.append(mse_metric.value)
-        avg_mae.append(mae_metric.value)
-        print(mse_metric)
-        print(mae_metric)
+        if trainer_obj._is_main_process():
+            avg_mse.append(mse_metric.value)
+            avg_mae.append(mae_metric.value)
+            print(mse_metric)
+            print(mae_metric)
 
-    if test_loader_336 is not None:
-        print("\nForecast horizon: 336")
-        model.n_outputs= 336
-        mse_metric, mae_metric= get_metrics(trainer, test_loader_336)
-        avg_mse.append(mse_metric.value)
-        avg_mae.append(mae_metric.value)
-        print(mse_metric)
-        print(mae_metric)
+        trainer_obj._barrier()
 
-    if test_loader_720 is not None:
-        print("\nForecast horizon: 720")
-        model.n_outputs= 720
-        mse_metric, mae_metric= get_metrics(trainer, test_loader_720)
-        avg_mse.append(mse_metric.value)
-        avg_mae.append(mae_metric.value)
-        print(mse_metric)
-        print(mae_metric)
+    trainer_obj._print(f"\n{data_name}")
+    eval_one_horizon( 96, test_loader_96)
+    eval_one_horizon(192, test_loader_192)
+    eval_one_horizon(336, test_loader_336)
+    eval_one_horizon(720, test_loader_720)
 
+    if not trainer_obj._is_main_process():
+        return None, None
     if len(avg_mse) == 0:
         return float("nan"), float("nan")
+
     return np.mean(avg_mse).item(), np.mean(avg_mae).item()
