@@ -658,10 +658,11 @@ class Trainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         checkpoint_path= self.get_checkpoint_path(f'{self.filename}.pth', self.checkpoint_dir)
         # construct checkpoint dictionary
+        model= self._unwrap_model()
         checkpoint= {
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'config': asdict(self.model.config),
+            'model_state_dict': model.state_dict(),
+            'config': asdict(model.config),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': best_val_loss,
             'train_losses': self.train_losses,
