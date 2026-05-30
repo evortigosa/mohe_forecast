@@ -81,7 +81,7 @@ class MAEMetric(SumEvaluationMetric):
 
 
 
-def get_metrics(trainer_obj, test_loader):
+def get_metrics(trainer_obj, test_loader, dynamic_window=True):
     """
     Build metric objects from full predictions and ground-truth tensors.
     In distributed mode:
@@ -89,7 +89,7 @@ def get_metrics(trainer_obj, test_loader):
     - only the main rank receives/uses full preds and trues;
     - non-main ranks return (None, None).
     """
-    preds, trues= trainer_obj.test(test_loader)
+    preds, trues= trainer_obj.test(test_loader, dynamic_window=dynamic_window)
 
     if not trainer_obj._is_main_process():
         return None, None
@@ -106,7 +106,7 @@ def get_metrics(trainer_obj, test_loader):
 
 
 def eval_forecast_horizons(trainer_obj, data_name, test_loader_96=None, test_loader_192=None,
-                           test_loader_336=None, test_loader_720=None):
+                           test_loader_336=None, test_loader_720=None, dynamic_window=True):
     """
     Evaluate multiple forecast horizons and return (avg_mse, avg_mae), i.e., {96, 192, 336, 720}
     In distributed mode:
@@ -123,7 +123,7 @@ def eval_forecast_horizons(trainer_obj, data_name, test_loader_96=None, test_loa
         # must happen on all ranks
         trainer_obj._print(f"\nForecast horizon: {horizon}")
         trainer_obj.set_forecast_horizon(horizon)
-        mse_metric, mae_metric= get_metrics(trainer_obj, loader)
+        mse_metric, mae_metric= get_metrics(trainer_obj, loader, dynamic_window)
 
         if trainer_obj._is_main_process():
             avg_mse.append(mse_metric.value)

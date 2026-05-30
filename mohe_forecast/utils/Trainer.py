@@ -290,7 +290,7 @@ class Trainer:
 
 
     @torch.inference_mode()
-    def test(self, test_loader=None, inverse_transform=False):
+    def test(self, test_loader=None, inverse_transform=False, dynamic_window=True):
         """
         Test the model on a test set. Safe for uneven last batches and correct under distributed sampler padding.
         Returns test predictions and test labels.
@@ -320,7 +320,9 @@ class Trainer:
 
             # --- forward pass and get logits ---
             if getattr(model_ref, "forecasting", False):
-                logits= model_ref.forecast(data, ts_mark=data_time, ts_mark_future=target_time)
+                logits= model_ref.forecast(
+                    data, ts_mark=data_time, ts_mark_future=target_time, dynamic_window=dynamic_window
+                )
                 if inverse_transform:
                     # invert the scaling back to the original units
                     logits= logits * scale_ + mean_
