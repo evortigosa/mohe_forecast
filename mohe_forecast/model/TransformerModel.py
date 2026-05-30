@@ -306,7 +306,7 @@ KV Cache
 """
 
 
-class KVCache:
+class KVCache(nn.Module):
     """
     Implements a Key-Value Cache module for Decoder-only Transformers.
     --- THIS IS A WIP ---
@@ -314,13 +314,14 @@ class KVCache:
     """
 
     def __init__(self, block_size, n_kv_heads, d_head) -> None:
+        super(KVCache, self).__init__()
         self.block_size= int(block_size)
         self.n_heads= int(n_kv_heads)
         self.d_head = int(d_head)
         self.cache_len= 0
         # None until init_cache is called
-        self.k_cache= None
-        self.v_cache= None
+        self.register_buffer("k_cache", None, persistent=False)
+        self.register_buffer("v_cache", None, persistent=False)
         self.batch_size= None
         self.device= None
         self.dtype = None
@@ -395,11 +396,12 @@ class KVCache:
         return self.k_cache, self.v_cache
 
 
-    def update(self, k, v):
+    def forward(self, k, v):
         """
-        Append T new KV vectors.
+        Append T new KV embeddings to the cache and returns the accumulated Key and Value
+        tensors up to the current position.
         """
-        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, n_kv_heads, T, d_head)"
+        assert k.ndim == 4 and v.ndim == 4, "k and v must be 4D: (B, n_heads, T, d_head)"
         B, nh, T_new, dh= k.shape
         assert nh == self.n_heads, f"n_kv_heads mismatch: {nh} vs {self.n_heads}"
         assert dh == self.d_head,  f"d_head mismatch: {dh} vs {self.d_head}"
@@ -422,7 +424,7 @@ class KVCache:
         # store key and value token embeddings into their respective caches
         self.k_cache[:B, :, self.cache_len:self.cache_len + T_new, :].copy_(k)
         self.v_cache[:B, :, self.cache_len:self.cache_len + T_new, :].copy_(v)
-        # assign all the previous token embeddings upto current token position to key and
+        # assign all the previous token embeddings up to current token position to key and
         # value variables for Attention calculation
         key= self.k_cache[:B, :, :self.cache_len + T_new, :]
         val= self.v_cache[:B, :, :self.cache_len + T_new, :]
@@ -700,11 +702,10 @@ class TransformerBlock(nn.Module):
     through the setting of flash_attn in the forward method.
     """
 
-    def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6,
-                 d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
-                 ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-                 exp_route_dropout=0.1, bias=False, rope_theta=10000.0, use_qk_norm=False,
-                 headwise_attn_gate=False, c_att_mode='full') -> None:
+    def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6, d_ff=768,
+                 dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False, ffn_type='dwconv', glu=False,
+                 n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0.1, exp_route_temperature=1.0,
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False, c_att_mode='full') -> None:
         super(TransformerBlock, self).__init__()
 
         # Self-Attention module to endogenous series
@@ -730,7 +731,7 @@ class TransformerBlock(nn.Module):
         self.norm3= self.get_norm(norm_type, d_model, init_alpha=0.2)
         self.ffn  = MoEFeedForward(
             d_model, d_ff, dropout, ffn_type, False, glu, n_experts, top_k_experts, experts_type,
-            exp_route_dropout, bias
+            exp_route_dropout, exp_route_temperature, bias
         )
         self.drop_path3= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
@@ -780,19 +781,17 @@ class TransformerModel(nn.Module):
     can be 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     """
 
-    def __init__(self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12,
-                 n_kv_heads=6, d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
-                 ffn_type='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type='fan',
-                 exp_route_dropout=0.1, bias=False, rope_theta=10000.0, use_qk_norm=False,
-                 headwise_attn_gate=False, c_att_mode='full') -> None:
+    def __init__(self, multi_modal, is_causal, n_layer=8, d_model=384, block_size=672, n_heads=12, n_kv_heads=6,
+                 d_ff=768, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False, ffn_type='dwconv', glu=False,
+                 n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0.1, exp_route_temperature=1.0,
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False, c_att_mode='full') -> None:
         super(TransformerModel, self).__init__()
         # block_size represents the max sequence length
         self.block_size= block_size
         # create a lower triangular matrix (2D tensor)
         self.register_buffer(
             'causal_mask_buffer',
-            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
-            persistent=False
+            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size), persistent=False
         )
         # causal mask is True when TransformerModel is a Decoder, and None when it is an Encoder
         self.causal_mask= True if is_causal else None
@@ -802,10 +801,9 @@ class TransformerModel(nn.Module):
         # define a stack of TransformerBlocks
         self.transformer= nn.ModuleList([
             TransformerBlock(
-                multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout,
-                sdp_rates[depth], norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-                experts_type, exp_route_dropout, bias, rope_theta, use_qk_norm, headwise_attn_gate,
-                c_att_mode
+                multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout, sdp_rates[depth],
+                norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts, experts_type, exp_route_dropout,
+                exp_route_temperature, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
             ) for depth in range(n_layer)
         ])
         # final normalization layer after the last TransformerBlock

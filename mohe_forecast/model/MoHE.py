@@ -280,18 +280,21 @@ Mixture-of-Experts (MoE)
 
 class MoEFeedForward(nn.Module):
     """
-    The Sparse Mixture-of-Experts (MoE) module for heterogeneous experts (MoHE). Delegate the
-    modeling of diverse time series patterns to sparse specialized experts in a data-driven manner
-    through a sparce router function (only K of N experts per token) for expert assignments.
+    The Sparse Mixture-of-Experts (MoE) module for heterogeneous experts (MoHE). Delegate the modeling of
+    diverse time series patterns to sparse specialized experts in a data-driven manner through a sparce router
+    function (only K of N experts per token) for expert assignments.
     - When n_experts=0, forward the input into a single FFN module; MoE otherwise.
-    - ffn_type (str): defines the shared_expert type from 'mlp' for MLP-FFN, 'conv' for Conv-FFN,
-    'dwconv' for DwConv-FFN, or 'fan' for FAN-FFN.
+    - ffn_type (str): defines the shared_expert type from 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for
+    DwConv-FFN, or 'fan' for FAN-FFN.
     - experts_type (str): defines the routed experts from 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - exp_route_temperature (float): controls the experts router entropy (higher temperature -> router is more
+    uncertain; routing is more diverse).
     See https://arxiv.org/abs/2410.10469 and https://arxiv.org/abs/2409.16040
     """
 
     def __init__(self, d_model, d_ff, dropout=0.2, ffn_type='dwconv', fan_gate=False, glu=False,
-                 n_experts=8, top_k=2, experts_type='fan', exp_route_dropout=0.1, bias=False) -> None:
+                 n_experts=8, top_k=2, experts_type='fan', exp_route_dropout=0.1, exp_route_temperature=1.0,
+                 bias=False) -> None:
         super(MoEFeedForward, self).__init__()
         assert n_experts >= 0, "n_experts must be non-negative"
         # store router probabilities for auxiliary load-balancing regularizers (losses)
@@ -328,6 +331,7 @@ class MoEFeedForward(nn.Module):
             self.gating= nn.Linear(d_model, n_experts, bias=False)
             # router regularization
             self.router_dropout= nn.Dropout(p=exp_route_dropout)
+            self.router_temperature= max(exp_route_temperature, 1e-6)
 
             # initialize gating modules with Glorot / fan_avg
             nn.init.xavier_uniform_(self.shared_gating.weight)
@@ -362,7 +366,7 @@ class MoEFeedForward(nn.Module):
         x_squashed= x.view(-1, C)  # (B * T, C)
         # compute router logits and probabilities via softmax
         router_logits= self.gating(x_squashed)  # (B * T, n_experts)
-        self.router_probs= self.router_dropout(F.softmax(router_logits.float(), dim=-1))
+        self.router_probs= self.router_dropout(F.softmax(router_logits.float() / self.router_temperature, dim=-1))
         # select top-k experts for each token (softmax scores and indices) -> (B * T, K)
         router, selected_experts= torch.topk(self.router_probs, self.top_k, dim=-1)
         # renormalize over top-k so they sum to 1 -- keeps MoE as a convex mixture

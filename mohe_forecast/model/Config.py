@@ -36,6 +36,8 @@ class BaseConfig:
     - top_k_experts (int): Default is 2. Defines the number of MoHE activated experts.
     - experts_type (str): Default is 'fan'. This can be 'mlp', 'fan'.
     - exp_route_dropout (float): Default is 0.1. Defines the dropout rate of expert routers.
+    - exp_route_temperature (float): Default is 1.0. Controls the experts router entropy (higher temperature ->
+    router is more uncertain; routing is more diverse).
     - output_head_type (str): Default is 'mlp'. This can be 'mlp', 'conv', 'dwconv', 'fan'.
     - fine_tune (bool): Default is True. When False, enables an extra layer before unpatching.
     - unpatch (str): Default is 'conv'. This can be 'mlp', 'conv'.
@@ -73,7 +75,8 @@ class BaseConfig:
     n_experts:int= 8
     top_k_experts:int= 2
     experts_type:str= 'fan'        # mlp, fan
-    exp_route_dropout:float=0.1    # expert gating regularization
+    exp_route_dropout:float= 0.1   # expert gating regularization
+    exp_route_temperature:float= 1.0
     output_head_type:str= 'mlp'    # mlp, conv, dwconv, fan
     fine_tune:bool= True           # enables an extra layer before unpatching
     unpatch:str= 'conv'            # mlp, conv
