@@ -65,7 +65,7 @@ def parse_overrides(items):
 
 
 def build_parser():
-    parser= argparse.ArgumentParser(description="CGM data training script")
+    parser= argparse.ArgumentParser(description="MoHETS forecasting train-test script")
     parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable text infos")
     # model
