@@ -5,6 +5,7 @@ Model Configuration
 """
 
 from dataclasses import dataclass
+from typing import TypeAlias
 
 
 
@@ -127,3 +128,6 @@ class UltraConfig(BaseConfig):
     n_heads:int= 16
     n_kv_heads:int= 8
     d_ff:int= 1024
+
+
+ModelConfig:TypeAlias= TinyConfig | SmallConfig | BaseConfig | LargeConfig | UltraConfig

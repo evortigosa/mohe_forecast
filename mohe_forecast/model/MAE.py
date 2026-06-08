@@ -10,6 +10,7 @@ from dataclasses import replace
 from .Normalization import InstanceNorm
 from .InEmbed import EmbeddingDecoderMAE
 from .TSFT import TSFTransformer
+from .Config import ModelConfig
 
 
 
@@ -20,7 +21,7 @@ class MohetsMAE(nn.Module):
     """
 
     def __init__(self, patch_width:int, channels:int, mask_ratio:float, use_input_norm:bool,
-                 cls_token:bool, encoder_config, decoder_config) -> None:
+                 cls_token:bool, encoder_config:ModelConfig, decoder_config:ModelConfig) -> None:
         super(MohetsMAE, self).__init__()
         self.channels= int(channels)
         assert 0.0 < mask_ratio < 1.0, "mask_ratio must be in (0, 1)"
