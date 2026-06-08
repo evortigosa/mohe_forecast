@@ -54,7 +54,7 @@ class PositionalEmbedding(nn.Module):
 
 class PatchMasking(nn.Module):
     """
-    Applies random masking to the patch embeddings for self-supervised training tasks.
+    Applies random masking to the patch embeddings for self-supervised pretraining tasks.
     A specified fraction (mask_ratio) of patches is set to zero.
     - If has_cls_tk=True, the class token (first token) is not masked.
     """
@@ -71,6 +71,7 @@ class PatchMasking(nn.Module):
 
 
     def forward(self, x, x_cross=None):
+        """ The masking mechanism is used only during self-supervised pretraining. """
         if (not self.training) or self.mask_ratio== 0.0:
             return x, x_cross
 
@@ -104,9 +105,9 @@ class PatchMasking(nn.Module):
 
 class PatchMaskingMAE(nn.Module):
     """
-    Performs random masking to the patch embeddings for self-supervised training tasks.
-    Masked Autoencoder (MAE) style: Only the visible patches are keep to feed the model.
-    - If has_cls_tk=True, the class token (first token) is not masked.
+    Performs random masking on patch embeddings for a Masked Autoencoder (MAE) encoder side in
+    self-supervised pretraining tasks. Only the visible patches are keep to feed the model.
+    - If has_cls_tk=True, the CLS token (first token) is not masked.
     Adapted from https://arxiv.org/abs/2111.06377
     """
 
@@ -122,6 +123,12 @@ class PatchMaskingMAE(nn.Module):
 
 
     def forward(self, x, x_cross=None):
+        """
+        In the standard MAE workflow, the masking mechanism is used only during self-supervised pretraining.
+        After pretraining, the encoder side is fine-tuned using the full visible input.
+        You may keep masking during fine-tuning if you want: regularization, similar to dropout; downstream
+        masked-reconstruction task, such as imputation; or settings where missingness exists naturally.
+        """
         if (not self.training) or self.mask_ratio== 0.0:
             return x, x_cross, None, None
 
@@ -459,22 +466,28 @@ class MultiModalEmbedding(nn.Module):
 
 class EmbeddingDecoderMAE(nn.Module):
     """
-    Expand the input for a Masked Autoencoder (MAE) style decoder. Only the visible patches are
-    keep by a MAE style encoder model. This module places zero tokens at the masked positions
-    to feed the MAE style decoder.
+    Expand the input for a Masked Autoencoder (MAE) decoder side. Only the visible patches are
+    keep by the MAE encoder side. This module places zeros at the masked positions to feed
+    the MAE decoder side.
+    - If has_cls_tk=True, the input has a CLS token (first token); False otherwise.
     Adapted from https://arxiv.org/abs/2111.06377
     """
 
     def __init__(self, enc_d_model, dec_d_model, has_cls_tk=False, bias=False) -> None:
         super(EmbeddingDecoderMAE, self).__init__()
         self.has_cls_tk= has_cls_tk
-        self.decoder_embed= nn.Linear(enc_d_model, dec_d_model, bias=bias)
+        # map encoder dimensions to decoder dimensions if they differ
+        self.decoder_embed= (
+            nn.Linear(enc_d_model, dec_d_model, bias=bias) if enc_d_model != dec_d_model else nn.Identity()
+        )
+        # learnable mask token for masked patches
         self.mask_token= nn.Parameter(torch.zeros(1, 1, dec_d_model))
 
         # initialize nn.Linear modules with Glorot / fan_avg
         nn.init.xavier_uniform_(self.decoder_embed.weight)
         if self.decoder_embed.bias is not None: nn.init.zeros_(self.decoder_embed.bias)
-        torch.nn.init.normal_(self.mask_token, std=.02)
+        # initialize mask_token with small normal distributions
+        nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
 
 
     def extra_repr(self):
@@ -482,9 +495,13 @@ class EmbeddingDecoderMAE(nn.Module):
 
 
     def forward(self, x, ids_restore, cls_token=None):
-        if cls_token is not None:
+        """
+        - cls_token (optional): an external CLS token not yet attached to x.
+        """
+        if (not self.has_cls_tk) and (cls_token is not None):
+            # the input x does not have a CLS token, but we provide it in cls_token
+            x= torch.cat([cls_token.unsqueeze(1), x], dim=1)  # append cls token
             self.has_cls_tk= True
-            x= torch.cat([cls_token.unsqueeze(1), x], dim=1)
 
         # embed tokens to decoder d_model
         x= self.decoder_embed(x)
@@ -496,7 +513,6 @@ class EmbeddingDecoderMAE(nn.Module):
             x_= torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         else:
             x_= torch.cat([x, mask_tokens], dim=1)
-
         # unshuffle
         x_= torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
 
