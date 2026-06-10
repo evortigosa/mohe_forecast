@@ -17,6 +17,7 @@ from .Config import ModelConfig
 class MohetsMAE(nn.Module):
     """
     Initializes a Masked Autoencoder (MAE) with MoHETS backbone.
+    - encoder_config and decoder_config are dataclass objects to initialize the backbone.
     --- THIS IS A WIP ---
     """
 
@@ -132,14 +133,18 @@ class MohetsMAE(nn.Module):
         if self.input_norm is not None:
             target= self.input_norm(target, 'norm')
 
-        loss= criterion(ts_pred, target)
+        loss= (ts_pred - target)**2 if criterion is None else criterion(ts_pred, target)
         loss= loss.mean(dim=-1)  # (BC, P) mean loss per patch
-        loss= (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        mask_sum= mask.sum()
+        if mask_sum.item() > 0.:
+            loss= (loss * mask).sum() / mask_sum  # mean loss on removed patches
+        else:
+            loss= loss.mean()  # mean loss on all patches (no removed patches)
 
         return loss
 
 
-    def forward(self, ts, mask_ratio=0.75, ts_mark=None, criterion=nn.MSELoss(reduction='none')):
+    def forward(self, ts, mask_ratio=0.75, ts_mark=None, criterion=None):
         """
         - ts_mark is an optional input for exogenous covariates.
         """
