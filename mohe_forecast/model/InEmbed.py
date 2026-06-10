@@ -129,9 +129,6 @@ class PatchMaskingMAE(nn.Module):
         You may keep masking during fine-tuning if you want: regularization, similar to dropout; downstream
         masked-reconstruction task, such as imputation; or settings where missingness exists naturally.
         """
-        if (not self.training) or self.mask_ratio== 0.0:
-            return x, x_cross, None, None
-
         if self.has_cls_tk:
             # ensure the class token will not be masked
             cls= x[:, 0, :]
@@ -144,7 +141,7 @@ class PatchMaskingMAE(nn.Module):
         # determine the number of patches to keep
         pto_keep= int(P * (1 - self.mask_ratio))
         # generate random indices for masking -- noise in [0, 1]
-        # ascend: small is keep, large is remove
+        # ascend: small is keep, large is to remove
         ids_shuffle= torch.rand(B, P, dtype=x.dtype, device=x.device).argsort(dim=1)
         ids_restore= torch.argsort(ids_shuffle, dim=1)
 
@@ -161,7 +158,7 @@ class PatchMaskingMAE(nn.Module):
         else:
             x_cross_masked= None
 
-        # generate the binary mask: 0 is keep, 1 is remove
+        # generate the binary mask: 0 is keep, 1 is to remove
         mask= torch.ones([B, P], device=x.device)
         mask[:, :pto_keep]= 0
         # unshuffle to get the binary mask
