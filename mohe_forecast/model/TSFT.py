@@ -48,7 +48,7 @@ class TSFTransformer(nn.Module):
         self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
         is_causal=False, forecasting=True, mask_ratio=0., mask_type='random', n_layer=6, d_model=256, block_size=672,
         n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False, ffn_type='dwconv',
-        glu=False, n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0.1, exp_route_temperature=1.0,
+        glu=False, n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0., exp_route_temperature=1.0,
         output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0, use_input_norm=True,
         emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False, cls_token=False,
         c_att_mode='full'
@@ -65,11 +65,11 @@ class TSFTransformer(nn.Module):
         # standardize text-based hyperparameters
         mask_type= mask_type.lower()
         norm_type= norm_type.lower()
-        ffn_type= ffn_type.lower()
+        ffn_type= ffn_type.lower() if isinstance(ffn_type, str) else None
         experts_type= experts_type.lower()
         output_head_type= output_head_type.lower()
         unpatch= unpatch.lower()
-        emb_norm_type= emb_norm_type.lower() if isinstance(emb_norm_type, str) else emb_norm_type
+        emb_norm_type= emb_norm_type.lower() if isinstance(emb_norm_type, str) else None
         c_att_mode= c_att_mode.lower()
 
         self.n_outputs= int(n_outputs)

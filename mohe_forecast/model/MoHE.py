@@ -302,9 +302,12 @@ class MoEFeedForward(nn.Module):
 
         # shared fallback expert -- ensures no token is unprocessed if its top-k experts happen
         # to be poorly trained or overflowed
-        self.shared_expert= self.get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias)
+        self.shared_expert= (
+            self.get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias) if ffn_type is not None else None
+        )
 
         if n_experts == 0:
+            assert self.shared_expert is not None, "ffn_type must be specified when n_experts is 0"
             self.experts= None
             self.top_k= 0
         else:
@@ -320,7 +323,7 @@ class MoEFeedForward(nn.Module):
                     "experts_type must be a string or a list of length n_experts"
 
             # controls contribution from fallback expert
-            self.shared_gating= nn.Linear(d_model, 1, bias=False)
+            self.shared_gating= nn.Linear(d_model, 1, bias=False) if self.shared_expert is not None else None
 
             # n_experts routed expert modules
             self.experts= nn.ModuleList([
@@ -334,7 +337,8 @@ class MoEFeedForward(nn.Module):
             self.router_temperature= max(exp_route_temperature, 1e-6)
 
             # initialize gating modules with Glorot / fan_avg
-            nn.init.xavier_uniform_(self.shared_gating.weight)
+            if self.shared_gating is not None:
+                nn.init.xavier_uniform_(self.shared_gating.weight)
             nn.init.xavier_uniform_(self.gating.weight)
 
 
@@ -392,8 +396,11 @@ class MoEFeedForward(nn.Module):
             current_expert= expert(expert_inputs) * routing_probs
             results.index_add_(0, token_idx, current_expert.to(x_squashed.dtype))
 
-        # shared fallback expert always applied
-        shared_out= self.shared_expert(x) * F.sigmoid(self.shared_gating(x))
-        results= results.view(B, T, C) + shared_out
+        if self.shared_expert is not None:
+            # shared fallback expert always applied
+            shared_out= self.shared_expert(x) * F.sigmoid(self.shared_gating(x))
+            results= results.view(B, T, C) + shared_out
+        else:
+            results= results.view(B, T, C)
 
         return results.contiguous()

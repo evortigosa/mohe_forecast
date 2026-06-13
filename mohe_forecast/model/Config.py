@@ -71,7 +71,7 @@ class BaseConfig:
     drop_path:float= 0.3
     norm_type:str= 'rms'           # layer, rms, dyt
     diff_attn:bool= False          # enables Differential Attention (WIP)
-    ffn_type:str= 'dwconv'         # mlp, conv, dwconv, fan
+    ffn_type:str|None= 'dwconv'    # mlp, conv, dwconv, fan
     glu:bool= False                # enables the Gated Linear Unit (GLU) architecture for experts
     n_experts:int= 8
     top_k_experts:int= 2
