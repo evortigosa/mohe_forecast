@@ -201,31 +201,25 @@ def setup_data_loaders(
             dataset_name_2= 'ETTh1'
 
         (
-            dec_train_loader, dec_val_loader, _, _, dec_tds_scaler, _,
-            enc_train_loader, enc_val_loader, _, _, enc_tds_scaler, _,
+            train_loader, val_loader, _, _, tds_scaler, _,
             test_loader_96, test_loader_192, test_loader_336, test_loader_720, _, _, _, _,
 
         )= get_ett_data_loaders(
             root_path, dataset_name_1, dataset_name_2, from_csv, btc_size, multi_modal, patch_width,
-            block_size, width_factor
+            block_size, width_factor, is_encoder_model=(not is_causal)
         )
     else:
         (
-            dec_train_loader, dec_val_loader, dec_tds_scaler,
-            enc_train_loader, enc_val_loader, enc_tds_scaler,
+            train_loader, val_loader, tds_scaler,
             test_loader_96, test_loader_192, test_loader_336, test_loader_720,
 
         )= get_custom_data_loaders(
             root_path, dataset_name, from_csv, btc_size, multi_modal, patch_width,
-            block_size, width_factor
+            block_size, width_factor, is_encoder_model=(not is_causal)
         )
-    if is_causal:
-        return (
-            dec_train_loader, dec_val_loader, dec_tds_scaler,
-            test_loader_96, test_loader_192, test_loader_336, test_loader_720,
-        )
+
     return (
-        enc_train_loader, enc_val_loader, enc_tds_scaler,
+        train_loader, val_loader, tds_scaler,
         test_loader_96, test_loader_192, test_loader_336, test_loader_720,
     )
 
