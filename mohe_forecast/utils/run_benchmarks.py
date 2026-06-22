@@ -6,6 +6,8 @@ MoHETS Long-term Forecasting Benchmark using ETT, Weather, ECL, and Traffic data
 import argparse
 import ast
 import inspect
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import lightning as L
@@ -70,10 +72,12 @@ def build_parser():
                         help="Enable or disable text infos")
     # model
     parser.add_argument("--model-size",  type=parse_value, default='tiny', help="Type of model configuration")
-    parser.add_argument("--block-size",  type=int, default=672, help="Input sequence length / context window")
-    parser.add_argument("--patch-width", type=int, default=8, help="Patch width")
-    parser.add_argument("--width-factor",type=float, default=3, help="Output patch width")
-    parser.add_argument("--n-outputs",   type=int, default=96, help="Prediction horizon / number of outputs")
+    # geometry args default to None: when omitted, the chosen --model-size preset keeps its own value
+    # (argparse can't tell a default from a user value, so None is the sentinel for 'not provided').
+    parser.add_argument("--block-size",  type=int, default=None, help="Input sequence length / context window (preset default if unset)")
+    parser.add_argument("--patch-width", type=int, default=None, help="Patch width (preset default if unset)")
+    parser.add_argument("--width-factor",type=float, default=None, help="Output horizon as a multiple of patch_width (preset default if unset)")
+    parser.add_argument("--n-outputs",   type=int, default=None, help="Prediction horizon / number of outputs (preset default if unset)")
     parser.add_argument("--channels",    type=int, default=7, help="Number of input channels")
     parser.add_argument("--covariates", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable or disable time stamp covariates")
@@ -136,6 +140,12 @@ def count_parameters(model) -> None:
     print(f'Number of model parameters: {total_params:,}')
 
 
+def seed_everything(seed:int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def setup_model_from_checkpoint(filename, checkpoint_dir, verbose=True):
     trainer= Trainer(
         model=None, device="cpu", train_loader=None, train_ds_scaler=None, val_loader=None, test_loader=None,
@@ -157,13 +167,20 @@ def setup_model(model_size, args):
 
     # explicit arguments that should always override preset defaults
     explicit_overrides= {
-        "patch_width": args.patch_width,
         "channels": args.channels,
-        "n_outputs": args.n_outputs,
-        "width_factor": args.width_factor,
         "multi_modal": args.covariates,
-        "block_size": args.block_size,
     }
+    # geometry knobs are preset-defined and differ across sizes (e.g. patch_width/width_factor), so only
+    # override them when the user actually passed them on the CLI (None == not provided). This approach
+    # keeps e.g. '--model-size base' at BaseConfig's geometry instead of inheriting CLI defaults
+    for _key, _val in (
+        ("patch_width", args.patch_width),
+        ("width_factor", args.width_factor),
+        ("block_size", args.block_size),
+        ("n_outputs", args.n_outputs),
+    ):
+        if _val is not None:
+            explicit_overrides[_key]= _val
     # generic overrides take final precedence
     overrides= {**explicit_overrides, **cli_overrides}
 
@@ -174,7 +191,6 @@ def setup_model(model_size, args):
         raise ValueError(f"Unknown config field(s) for {config_cls.__name__}: {sorted(unknown)}")
     # apply overrides
     config= replace(config, **overrides)
-
     model= TSFTransformer.from_config(config)
 
     return model, model.config
@@ -285,6 +301,7 @@ def main():
     args= build_parser().parse_args()
     verbose= args.verbose
     devices= max(args.devices, 1)
+    num_nodes= max(args.num_nodes, 1)
     strategy= args.strategy
     fabric= None
 
@@ -292,16 +309,20 @@ def main():
     use_flashattn= False
 
     try:
-        if strategy is not None:
+        # enable distributed execution when a strategy is given OR more than one device/node is requested
+        if (strategy is not None) or (devices > 1) or (num_nodes > 1):
             # create the Fabric object before model, loaders, optimizer, or any early CUDA allocation
             fabric= L.Fabric(
-                accelerator=device, devices=devices, num_nodes=max(args.num_nodes, 1), strategy=strategy,
+                accelerator=device, devices=devices, num_nodes=num_nodes, strategy=(strategy or 'auto'),
                 precision=args.precision, plugins=args.plugins, callbacks=args.callbacks,
             )
             fabric.launch()
 
         if args.seed is not None:
-            torch.manual_seed(int(args.seed))
+            if fabric is not None:
+                fabric.seed_everything(int(args.seed), workers=False)  # fine with DataLoader(..., num_workers=0)
+            else:
+                seed_everything(int(args.seed))
         if fabric is not None:
             verbose= verbose if fabric.is_global_zero else False
 
@@ -362,7 +383,8 @@ def main():
         if args.train:
             trainer.train(epochs, use_bf16=args.bf16, clip_grad=args.clip_grad, get_moe_metrics=args.moe_metrics)
 
-            if args.save_plots:
+            # plotting writes files and reads single-process state; only the main rank should do it
+            if args.save_plots and trainer._is_main_process():
                 trainer.plot_results(cut_first_epoch=args.plot_cut_first, show_plot=False, save_charts=True, file_name=f"{plot_file}_losses")
                 trainer.plot_expert_routing_diagnostics(show_plot=False, save_charts=True, file_name=f"{plot_file}_expert_routing")
                 if model_config.n_experts <= 8:
@@ -382,7 +404,7 @@ def main():
                 print(f"\nAverage MSE: {avg_mse:.4f}, Average MAE: {avg_mae:.4f}")
 
     finally:
-        if (fabric is not None) and devices > 1:
+        if (fabric is not None) and dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
 
 
