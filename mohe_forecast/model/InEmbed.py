@@ -72,7 +72,7 @@ class PatchMasking(nn.Module):
 
     def forward(self, x, x_cross=None):
         """ The masking mechanism is used only during self-supervised pretraining. """
-        if (not self.training) or self.mask_ratio== 0.0:
+        if self.mask_ratio== 0.:
             return x, x_cross
 
         if self.has_cls_tk:
@@ -495,17 +495,20 @@ class EmbeddingDecoderMAE(nn.Module):
         """
         - cls_token (optional): an external CLS token not yet attached to x.
         """
-        if (not self.has_cls_tk) and (cls_token is not None):
+        # local flag: whether the working sequence carries a CLS token at position 0
+        has_cls= self.has_cls_tk
+        if (not has_cls) and (cls_token is not None):
             # the input x does not have a CLS token, but we provide it in cls_token
-            x= torch.cat([cls_token.unsqueeze(1), x], dim=1)  # append cls token
-            self.has_cls_tk= True
+            x= torch.cat([cls_token.unsqueeze(1), x], dim=1)  # prepend cls token
+            has_cls= True
 
         # embed tokens to decoder d_model
         x= self.decoder_embed(x)
-        # append mask tokens to sequence
-        mask_tokens= self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        # append mask tokens to sequence. The count is exactly the number of masked patches
+        n_mask= ids_restore.shape[1] + int(has_cls) - x.shape[1]
+        mask_tokens= self.mask_token.repeat(x.shape[0], n_mask, 1)
 
-        if self.has_cls_tk:
+        if has_cls:
             # temporarily remove the cls token from the input
             x_= torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         else:
@@ -513,7 +516,7 @@ class EmbeddingDecoderMAE(nn.Module):
         # unshuffle
         x_= torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
 
-        if self.has_cls_tk:
+        if has_cls:
             # append cls token from the input
             x= torch.cat([x[:, :1, :], x_], dim=1)
             return x

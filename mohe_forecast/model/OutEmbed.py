@@ -6,6 +6,7 @@ Output Embedding Modules
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .MoHE import FeedForward, ConvFeedForward, DwConvFeedForward, FANLayer, FANFeedForward
 
 
@@ -206,6 +207,7 @@ class LinearUnPatch(nn.Module):
         self.channels  = channels
         self.individual= individual
         self.out_channels= 1 if ch_independence else channels
+        self.n_patches= n_patches
         input_dim= n_patches * d_model
 
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
@@ -225,7 +227,28 @@ class LinearUnPatch(nn.Module):
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
 
+    def _fit_patches(self, x):
+        """
+        During autoregressive generation the context length (the patch count P) varies, while the
+        flatten-linear projection expects exactly n_patches. We keep the most recent n_patches when P
+        is larger, and left-pad with zeros (on the oldest side) when P is smaller, so the real patches
+        always occupy the most-recent projection slots. When P == n_patches (the standard fixed-window
+        training case) this is a no-op, so training is unchanged.
+        """
+        P= x.size(1)
+        if P == self.n_patches:
+            return x
+        if P > self.n_patches:
+            # keep the most recent patches
+            return x[:, -self.n_patches:, :].contiguous()
+        # P < n_patches -> left-pad the patch dimension with zeros.
+        # F.pad order for a 3D tensor is (d_model_left, d_model_right, patch_left, patch_right)
+        return F.pad(x, (0, 0, self.n_patches - P, 0))
+
+
     def forward(self, x):
+        # fit the (possibly variable) patch count to the fixed size the projection expects
+        x= self._fit_patches(x)
         B, _, _= x.shape  # (batch_size * channels/features, num_patches, d_model)
 
         if self.individual:

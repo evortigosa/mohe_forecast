@@ -222,6 +222,7 @@ class TSFTransformer(nn.Module):
             self.mask_layer = None
 
         self.backbone.def_causal_mask(self.is_causal, flash_attn)
+        self.set_horizon()
 
         return f"Model type switched to is_causal={self.is_causal}"
 
@@ -295,12 +296,27 @@ class TSFTransformer(nn.Module):
 
         B, C, T= ts.size()
         assert T >= f_step, f"Initial sequence length {T} must be >= forecast step {f_step}"
+        # need at least one full patch so the conv patch-embed yields >= 1 token
+        assert T >= self.patch_width, f"Initial sequence length {T} must be >= patch_width {self.patch_width}"
+        # when future covariates are used, they must cover the forecast horizon
+        if (ts_mark is not None) and (ts_mark_future is not None):
+            assert ts_mark_future.size(-1) >= self.n_outputs, \
+                f"ts_mark_future length ({ts_mark_future.size(-1)}) must be >= horizon n_outputs ({self.n_outputs})"
         round_t= int(n_patches * f_step)
         out= torch.zeros([B, C, round_t], device=ts.device, dtype=ts.dtype)
 
+        # remember the prior mode so it can be restored on exit (generation runs in eval)
+        was_training= self.training
         self.eval()
         try:
             for i in range(n_patches):
+                # keep the context patch-aligned. Trim the OLDEST points so the newest context is always consumed
+                rem= ts.size(-1) % self.patch_width
+                if rem:
+                    ts= ts[:, :, rem:]
+                    if ts_mark is not None:
+                        ts_mark= ts_mark[:, :, rem:]
+
                 logits, *_= self.forward(ts, ts_mark=ts_mark, flash_attn=False)
                 if end_f_patch_width > 0:
                     future= logits[:, :, -f_patch_width:-end_f_patch_width]
@@ -330,7 +346,7 @@ class TSFTransformer(nn.Module):
             if last_token > 0:
                 out= out[:, :, :-last_token]     # extract exactly the prediction horizon
         finally:
-            self.train()
+            self.train(was_training)
 
         return out
 

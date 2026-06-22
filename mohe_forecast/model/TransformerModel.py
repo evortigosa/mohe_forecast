@@ -502,11 +502,11 @@ class DifferentialAttention(nn.Module):
             y= attn @ v  # (B, nh, T, dh)
         else:
             # Differential FlashAttention
-            q= q.reshape(B, -1, T, 2, self.d_head)
-            k= k.reshape(B, -1, T, 2, self.d_head)
+            q= q.reshape(B, -1, 2, T, self.d_head)
+            k= k.reshape(B, -1, 2, T, self.d_head)
             # query and key matrices are split into two groups
-            q1, q2= q[:, :, :, 0], q[:, :, :, 1]
-            k1, k2= k[:, :, :, 0], k[:, :, :, 1]
+            q1, q2= q[:, :, 0], q[:, :, 1]
+            k1, k2= k[:, :, 0], k[:, :, 1]
             # compute Attention using FlashAttention kernels
             y1= F.scaled_dot_product_attention(
                 q1, k1, v, dropout_p=self.dropout.p, is_causal=mask

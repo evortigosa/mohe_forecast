@@ -37,8 +37,11 @@ class MohetsMAE(nn.Module):
         self.encoder= TSFTransformer.from_config(replace(encoder_config, **enc_overrides))
 
         # MAE decoder side
+        # NOTE: the encoder strips the CLS from latent and returns it separately, so the tensor
+        # fed to the decoder embedding never carries a CLS. We pass has_cls_tk=False and let
+        # EmbeddingDecoderMAE.forward prepend the externally-supplied CLS token when present.
         self.decoder_embedding= EmbeddingDecoderMAE(
-            encoder_config.d_model, decoder_config.d_model, cls_token, encoder_config.bias
+            encoder_config.d_model, decoder_config.d_model, False, encoder_config.bias
         )
         dec_block_size= self.encoder.block_size
         if cls_token:
@@ -46,8 +49,10 @@ class MohetsMAE(nn.Module):
 
         dec_overrides= {
             "patch_width": patch_width, "channels": channels, "is_causal": False,
-            "mask_ratio": 0., "mask_type": 'mae', "use_input_norm": False,
+            "mask_ratio": 0., "mask_type": 'mae', "use_input_norm": False, "rope_theta": 0.,
             "cls_token": False, "emb_norm_type": None, "block_size": dec_block_size,
+            # the MAE decoder operates in latent space and does not cross-attend to raw covariates
+            "multi_modal": None,
         }
         self.decoder= TSFTransformer.from_config(replace(decoder_config, **dec_overrides))
 
@@ -92,7 +97,10 @@ class MohetsMAE(nn.Module):
         x= torch.einsum('bnpc->bcnp', x)
         ts= x.reshape(B, self.channels * 1, n * p)
 
-        if (self.input_norm is not None) and x.ndim == ts.ndim:
+        # denormalize the reconstructed series. NOTE: this reuses the stats stored by the most recent
+        # input_norm 'norm' call, so call unpatchify while the encoder-input stats are current (i.e.
+        # not after forward_loss, which overwrites them with per-patch stats).
+        if self.input_norm is not None:
             ts= self.input_norm(ts, 'denorm')
 
         return ts
@@ -112,11 +120,14 @@ class MohetsMAE(nn.Module):
         return latent, enc_router, cls_token, mask, ids_restore
 
 
-    def forward_decoder(self, latent, ids_restore, cls_token, ts_mark=None):
-        # cls token will be handled by the decoder_embedding (when it is present)
+    def forward_decoder(self, latent, ids_restore, cls_token):
+        """
+        The MAE decoder operates in latent space and does not consume exogenous covariates: those
+        are incorporated on the encoder side.
+        """
+        # cls token is handled by the decoder_embedding and stripped inside the decoder head.
         latent= self.decoder_embedding(latent, ids_restore, cls_token)
-        # discard cls token when it is present
-        logits, dec_router, *_= self.decoder(latent, ts_mark=ts_mark, ext_cls_token=cls_token)
+        logits, dec_router, *_= self.decoder(latent, ext_cls_token=cls_token)
 
         return logits, dec_router
 
@@ -129,9 +140,14 @@ class MohetsMAE(nn.Module):
         mask: (BC, P) -> 0 is keep, 1 is removing
         """
         target= self.patchify(ts)
-        # "online" normalization
+        # per-patch target normalization (norm_pix_loss, He et al. 2021). Computed INLINE with local stats
+        # so it does NOT overwrite self.input_norm's encoder-input statistics (the [B, C, 1] stats stored
+        # during forward_encoder, which unpatchify/denorm rely on). This is numerically identical to the
+        # previous self.input_norm(target, 'norm') call (per-patch mean, biased variance, eps inside the sqrt)
         if self.input_norm is not None:
-            target= self.input_norm(target, 'norm')
+            p_mean = target.mean(dim=-1, keepdim=True)
+            p_stdev= torch.sqrt(target.var(dim=-1, keepdim=True, unbiased=False) + self.input_norm.eps)
+            target = (target - p_mean) / p_stdev
 
         loss= (ts_pred - target)**2 if criterion is None else criterion(ts_pred, target)
         loss= loss.mean(dim=-1)  # (BC, P) mean loss per patch
@@ -149,7 +165,7 @@ class MohetsMAE(nn.Module):
         - ts_mark is an optional input for exogenous covariates.
         """
         latent, enc_router, cls_token, mask, ids_restore= self.forward_encoder(ts, mask_ratio, ts_mark)
-        logits, dec_router= self.forward_decoder(latent, ids_restore, cls_token, ts_mark)
+        logits, dec_router= self.forward_decoder(latent, ids_restore, cls_token)
         loss= self.forward_loss(ts, logits, mask, criterion)  # logits -> (B*C, P, patch_width)
 
-        return loss, logits, enc_router, dec_router
+        return loss, logits, mask, enc_router, dec_router
