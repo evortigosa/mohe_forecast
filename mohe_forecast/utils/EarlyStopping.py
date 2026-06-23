@@ -24,6 +24,7 @@ class EarlyStopping:
         self.verbose= verbose
         self.counter= 0
         self.best_loss= math.inf if mode == "min" else -math.inf
+        self.best_epoch= -1
         self.early_stop= False
         # --- minimal logging ---
         self._log= logging.getLogger(self.__class__.__name__)

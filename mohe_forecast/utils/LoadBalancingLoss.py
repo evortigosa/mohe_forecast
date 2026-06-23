@@ -115,7 +115,9 @@ class LoadBalancingLoss:
         """
         concatenated_router_probs= self.flatten_router_probs(router_probs)  # [N, E]
         if concatenated_router_probs is None:
-            return torch.zeros([]), None, None
+            # no MoE router probabilities -> zero aux loss. Return a Python float (not a CPU tensor)
+            # so that 'task_loss + aux_loss' stays on the task loss's device
+            return 0.0, None, None
 
         device= concatenated_router_probs.device
         _, selected_experts= torch.topk(concatenated_router_probs, self.top_k, dim=-1)  # [N, K]

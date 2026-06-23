@@ -366,12 +366,12 @@ class Trainer:
 
 
     @torch.inference_mode()
-    def validate(self, val_criterion=nn.MSELoss(reduction='none')):
+    def validate(self, val_criterion=None):
         """
         Validate the model on a validation set.
         """
         self.model.eval()
-        val_criterion= val_criterion if val_criterion is not None else self.criterion
+        val_criterion= val_criterion if val_criterion is not None else nn.MSELoss(reduction='none')
         val_loss= torch.tensor(0.0, device=self.device)
         n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
         p_bar= self.disable_tqdm or not self._is_main_process()
@@ -396,14 +396,14 @@ class Trainer:
 
 
     @torch.inference_mode()
-    def validate_bf16(self, val_criterion=nn.MSELoss(reduction='none')):
+    def validate_bf16(self, val_criterion=None):
         """
         Validate the model on a validation set using bfloat16.
         """
         assert self.device.type == 'cuda', "BF16 training requires CUDA"
 
         self.model.eval()
-        val_criterion= val_criterion if val_criterion is not None else self.criterion
+        val_criterion= val_criterion if val_criterion is not None else nn.MSELoss(reduction='none')
         val_loss= 0.0
         n_samples= 0
 
@@ -465,8 +465,10 @@ class Trainer:
                     layer_metrics = self._reduce_moe_metrics(layer_metrics)
                     self.expert_traker.update(global_metrics, layer_metrics)
 
-            # check loss finite
-            if not torch.isfinite(loss).all():
+            # check loss finite -- collectively, so that under DDP every rank raises together
+            not_finite= (~torch.isfinite(loss).all()).to(torch.long)
+            not_finite= self._reduce_sum(not_finite)
+            if int(not_finite.item()) > 0:
                 self._set_log("error",
                     f"train_one_epoch | non_finite_loss | epoch=%d | loss=%s" % (epoch, str(loss.detach().cpu()))
                 )
@@ -478,11 +480,11 @@ class Trainer:
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
+            epoch_lr += self.optimizer.param_groups[0]['lr']
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            epoch_lr += self.optimizer.param_groups[0]['lr']
             n_steps += 1
 
         if self.augmentation is not None:
@@ -491,7 +493,7 @@ class Trainer:
         train_loss= self._reduce_sum(train_loss)
         n_samples = self._reduce_sum(n_samples)
         train_loss= train_loss / n_samples.clamp_min(1)
-        epoch_lr  = epoch_lr / n_steps
+        epoch_lr  = epoch_lr / max(n_steps, 1)
 
         return float(train_loss.item()), epoch_lr
 
@@ -551,17 +553,17 @@ class Trainer:
 
             # --- update the parameters using the gradient ---
             self.optimizer.step()
+            epoch_lr += self.optimizer.param_groups[0]['lr']
             # per-step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            epoch_lr += self.optimizer.param_groups[0]['lr']
             n_steps += 1
 
         if self.augmentation is not None:
             self.augmentation.step_epoch()
 
-        train_loss= train_loss / n_samples
+        train_loss= train_loss / max(n_samples, 1)
         epoch_lr  = epoch_lr / max(n_steps, 1)
 
         return train_loss, epoch_lr
@@ -613,7 +615,9 @@ class Trainer:
                 did_validation= True
             else:
                 did_validation= False
-            self.val_losses.append(val_loss)
+            # keep val_losses aligned 1:1 with train_losses (for plotting). On epochs without a validation pass,
+            # append a NaN sentinel, so the curve gaps truthfully and downstream stats are not polluted
+            self.val_losses.append(val_loss if did_validation else float('nan'))
 
             if self.expert_traker is not None:
                 self.expert_traker.finalize_epoch()
@@ -621,7 +625,7 @@ class Trainer:
             peak_vram= self._get_cuda_memory_stats()
             end= time.time()
             dt = self._format_dt(end - start)
-            val_loss_log= f'{val_loss:.6f}' if did_validation else 'N/A'  # did_validation is False
+            val_loss_log= f'{val_loss:.6f}' if did_validation else 'N/A'
             self._set_log("info",
                 f"train | epoch=%d/%d | train_loss=%.6f | val_loss=%s | lr=%.4e | max GPU mem=%.2fGB | dt=%sms" % \
                 (epoch+1, epochs, train_loss, val_loss_log, epoch_lr, peak_vram, dt)
@@ -636,12 +640,11 @@ class Trainer:
                         self.save_checkpoint(epoch, best_val_loss)
 
                 if self.early_stopping is not None:
-                    # Watches validation MSE and halts training if it hasn't improved
-                    avg_val_loss= float(np.mean(self.val_losses))
-                    if self.early_stopping(avg_val_loss, epoch+1):
+                    # watches the current validation loss and halts if it hasn't improved within patience
+                    if self.early_stopping(val_loss, epoch+1):
                         self._set_log(
-                            "warning", f"train | early_stopping_triggered | epoch=%d | avg_val_loss=%.6f" % \
-                            (epoch+1, avg_val_loss)
+                            "warning", f"train | early_stopping_triggered | epoch=%d | val_loss=%.6f" % \
+                            (epoch+1, val_loss)
                         )
                         break
 
@@ -677,7 +680,7 @@ class Trainer:
             # (optional) save full expert tracker history in a separate file
             if self.expert_traker is not None:
                 traker_path= self.get_checkpoint_path(f'{self.filename}_expert_traker.pt', self.checkpoint_dir)
-                self._save(self.expert_traker.state_dict(), traker_path)
+                self._save(self.expert_traker.state_dict(compact=True), traker_path)
             self._set_log(
                 "info", f"save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s" % \
                  (epoch+1, best_val_loss, checkpoint_path)
@@ -857,7 +860,12 @@ class Trainer:
         plt.figure(figsize=(14, 5))
         plt.subplot(1, 2, 1)
         plt.plot(epochs, train_losses, label='Train Loss', marker='o', linestyle='-')
-        plt.plot(epochs, val_losses, label='Validation Loss', marker='o', linestyle='-')
+        # validation loss may contain NaN sentinels on epochs without a validation pass. Plot only the evaluated
+        # epochs so the curve connects across the gaps instead of breaking the line at every NaN
+        epochs_arr= np.asarray(list(epochs), dtype=float)
+        val_arr= np.asarray(val_losses, dtype=float)
+        val_finite= np.isfinite(val_arr)
+        plt.plot(epochs_arr[val_finite], val_arr[val_finite], label='Validation Loss', marker='o', linestyle='-')
         plt.title('Training and Validation Loss')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')

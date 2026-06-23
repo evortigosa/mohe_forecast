@@ -53,6 +53,11 @@ class DTrainer(Trainer):
         # setup model and optimizer
         assert self.model is not None, "Model must be provided."
         assert self.optimizer is not None, "Optimizer must be provided."
+        # keep a reference to the bare module BEFORE Fabric wraps it. Fabric/DDP wrap by reference and
+        # move parameters in place, so this reference stays valid and on-device, and writing to it
+        # (e.g. set_forecast_horizon -> n_outputs) is seen by the wrapped forward. More robust than
+        # unwrapping via '.module', which does not resolve for single-device Fabric
+        self._bare_model= self.model
         self.model, self.optimizer= self.fabric.setup(self.model, self.optimizer)
         # setup dataloaders
         if self.train_loader is not None:
@@ -64,6 +69,8 @@ class DTrainer(Trainer):
 
 
     def _unwrap_model(self):
+        if getattr(self, "_bare_model", None) is not None:
+            return self._bare_model
         return self.model.module if hasattr(self.model, "module") else self.model
 
 
