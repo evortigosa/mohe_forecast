@@ -55,11 +55,13 @@ class PositionalEmbedding(nn.Module):
 class PatchMasking(nn.Module):
     """
     Applies random masking to the patch embeddings for self-supervised pretraining tasks.
-    A specified fraction (mask_ratio) of patches is set to zero.
+    A specified fraction (mask_ratio) of patches is set to zero. PatchMasking masks patches by zeroing
+    them in place.
+    being dropped, so the sequence length is unchanged.
     - If has_cls_tk=True, the class token (first token) is not masked.
     """
 
-    def __init__(self, mask_ratio=0.2, has_cls_tk=False) -> None:
+    def __init__(self, mask_ratio=0.75, has_cls_tk=False) -> None:
         super(PatchMasking, self).__init__()
         assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
         self.mask_ratio= mask_ratio
@@ -72,32 +74,42 @@ class PatchMasking(nn.Module):
 
     def forward(self, x, x_cross=None):
         """ The masking mechanism is used only during self-supervised pretraining. """
-        if self.mask_ratio== 0.:
+        # ---- fast path: nothing to mask (fine-tuning / inference) ----
+        if self.mask_ratio == 0.:
             return x, x_cross
 
+        # ---- general path: fixed-count random patch masking ----
+        cls= None
+        cls_cross= None
         if self.has_cls_tk:
             # ensure the class token will not be masked
-            cls= x[:, 0, :]
+            cls= x[:, :1, :]
             x  = x[:, 1:, :]
             if x_cross is not None:
-                cls_cross= x_cross[:, 0, :]
+                cls_cross= x_cross[:, :1, :]
                 x_cross  = x_cross[:, 1:, :]
 
         B, P, C= x.size()  # (batch_size, num_patches, d_model)
-        # create a binary mask of shape (B, P): True means the patch is masked
-        mask= torch.rand(B, P, dtype=x.dtype, device=x.device) < self.mask_ratio
+        # the masked subset is chosen uniformly at random per sample via a random shuffle of patch indices
+        pto_keep= int(P * (1 - self.mask_ratio))
+        ids_shuffle= torch.rand(B, P, dtype=x.dtype, device=x.device).argsort(dim=1)
+        ids_restore= torch.argsort(ids_shuffle, dim=1)
+        # binary mask in shuffled order (1=mask, 0=keep): first pto_keep are kept, then unshuffle
+        mask= torch.ones(B, P, dtype=x.dtype, device=x.device)
+        mask[:, :pto_keep]= 0
+        mask= torch.gather(mask, dim=1, index=ids_restore).bool()  # (B, P): exactly P-pto_keep True/row
         # expand mask to match x dimensions (B, P, 1)
         mask= mask.unsqueeze(-1)
 
         # set masked positions to zero
         x= x.masked_fill(mask, value=0.0)
-        if self.has_cls_tk:
-            x= torch.cat((cls.unsqueeze(1), x), dim=1)
+        if cls is not None:
+            x= torch.cat((cls, x), dim=1)
 
         if x_cross is not None:
             x_cross= x_cross.masked_fill(mask, value=0.0)
-            if self.has_cls_tk:
-                x_cross= torch.cat((cls_cross.unsqueeze(1), x_cross), dim=1)
+            if cls_cross is not None:
+                x_cross= torch.cat((cls_cross, x_cross), dim=1)
 
         return x, x_cross
 
@@ -105,13 +117,14 @@ class PatchMasking(nn.Module):
 
 class PatchMaskingMAE(nn.Module):
     """
-    Performs random masking on patch embeddings for a Masked Autoencoder (MAE) encoder side in
-    self-supervised pretraining tasks. Only the visible patches are keep to feed the model.
+    Random masking of patch embeddings for the MAE encoder side (self-supervised pretraining).
+    Only the visible (kept) patches are returned to feed the encoder -- this is the efficiency
+    trick of MAE: the heavy encoder only ever sees ~25% of the tokens.
     - If has_cls_tk=True, the CLS token (first token) is not masked.
     Adapted from https://arxiv.org/abs/2111.06377
     """
 
-    def __init__(self, mask_ratio=0.2, has_cls_tk=False) -> None:
+    def __init__(self, mask_ratio=0.75, has_cls_tk=False) -> None:
         super(PatchMaskingMAE, self).__init__()
         assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
         self.mask_ratio= mask_ratio
@@ -124,37 +137,47 @@ class PatchMaskingMAE(nn.Module):
 
     def forward(self, x, x_cross=None):
         """
-        In the standard MAE workflow, the masking mechanism is used only during self-supervised pretraining.
-        After pretraining, the encoder side is fine-tuned using the full visible input.
-        You may keep masking during fine-tuning if you want: regularization, similar to dropout; downstream
-        masked-reconstruction task, such as imputation; or settings where missingness exists naturally.
+        Masking is a pretraining-only trick. After pretraining the encoder is fine-tuned / evaluated
+        on the full input (mask_ratio=0), so we add a fast path for that case.
         """
+        cls= None
+        cls_cross= None
         if self.has_cls_tk:
             # ensure the class token will not be masked
-            cls= x[:, 0, :]
+            cls= x[:, :1, :]
             x  = x[:, 1:, :]
             if x_cross is not None:
-                cls_cross= x_cross[:, 0, :]
+                cls_cross= x_cross[:, :1, :]
                 x_cross  = x_cross[:, 1:, :]
 
         B, P, C= x.size()  # (batch_size, num_patches, d_model)
+        # ---- fast path: nothing to mask (fine-tuning / inference) ----
+        if self.mask_ratio == 0.:
+            mask= torch.zeros(B, P, device=x.device, dtype=x.dtype)
+            ids_restore= torch.arange(P, device=x.device).unsqueeze(0).repeat(B, 1)
+            x_masked= x if cls is None else torch.cat((cls, x), dim=1)
+            x_cross_masked= x_cross if cls_cross is None else torch.cat((cls_cross, x_cross), dim=1)
+
+            return x_masked, x_cross_masked, mask, ids_restore
+
+        # ---- general path: random per-sample masking ----
         # determine the number of patches to keep
         pto_keep= int(P * (1 - self.mask_ratio))
         # generate random indices for masking -- noise in [0, 1]
-        # ascend: small is keep, large is to remove
+        # ascend: small noise -> keep, large noise -> remove
         ids_shuffle= torch.rand(B, P, dtype=x.dtype, device=x.device).argsort(dim=1)
         ids_restore= torch.argsort(ids_shuffle, dim=1)
 
-        # keep the first subset
+        # gather the first subset of the shuffled patches (the "visible" ones)
         ids_keep= ids_shuffle[:, :pto_keep]
         x_masked= torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
-        if self.has_cls_tk:
-            x_masked= torch.cat((cls.unsqueeze(1), x_masked), dim=1)
+        if cls is not None:
+            x_masked= torch.cat((cls, x_masked), dim=1)
 
         if x_cross is not None:
             x_cross_masked= torch.gather(x_cross, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, C))
-            if self.has_cls_tk:
-                x_cross_masked= torch.cat((cls_cross.unsqueeze(1), x_cross_masked), dim=1)
+            if cls_cross is not None:
+                x_cross_masked= torch.cat((cls_cross, x_cross_masked), dim=1)
         else:
             x_cross_masked= None
 
@@ -463,9 +486,10 @@ class MultiModalEmbedding(nn.Module):
 
 class EmbeddingDecoderMAE(nn.Module):
     """
-    Expand the input for a Masked Autoencoder (MAE) decoder side. Only the visible patches are
-    keep by the MAE encoder side. This module places zeros at the masked positions to feed
-    the MAE decoder side.
+    Builds the decoder input for a Masked Autoencoder (MAE). The encoder only emitted the visible
+    tokens, so here we (1) project them to the decoder width, (2) re-insert a learnable mask token
+    at every removed position, (3) unshuffle everything back to the original order, and (4) add
+    decoder positional embeddings.
     - If has_cls_tk=True, the input has a CLS token (first token); False otherwise.
     Adapted from https://arxiv.org/abs/2111.06377
     """
@@ -473,11 +497,11 @@ class EmbeddingDecoderMAE(nn.Module):
     def __init__(self, enc_d_model, dec_d_model, has_cls_tk=False, bias=False) -> None:
         super(EmbeddingDecoderMAE, self).__init__()
         self.has_cls_tk= has_cls_tk
-        # map encoder dimensions to decoder dimensions if they differ
+        # map encoder width to decoder width (identity if they already match)
         self.decoder_embed= (
             nn.Linear(enc_d_model, dec_d_model, bias=bias) if enc_d_model != dec_d_model else nn.Identity()
         )
-        # learnable mask token for masked patches
+        # learnable mask token for masked patches -- broadcast to every removed position
         self.mask_token= nn.Parameter(torch.zeros(1, 1, dec_d_model))
 
         # initialize nn.Linear modules with Glorot / fan_avg
@@ -502,18 +526,18 @@ class EmbeddingDecoderMAE(nn.Module):
             x= torch.cat([cls_token.unsqueeze(1), x], dim=1)  # prepend cls token
             has_cls= True
 
-        # embed tokens to decoder d_model
+        # project visible tokens to decoder n_embed
         x= self.decoder_embed(x)
         # append mask tokens to sequence. The count is exactly the number of masked patches
         n_mask= ids_restore.shape[1] + int(has_cls) - x.shape[1]
         mask_tokens= self.mask_token.repeat(x.shape[0], n_mask, 1)
 
         if has_cls:
-            # temporarily remove the cls token from the input
+            # temporarily remove the cls token while we unshuffle patches
             x_= torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         else:
             x_= torch.cat([x, mask_tokens], dim=1)
-        # unshuffle
+        # unshuffle: scatter visible + mask tokens back to their original patch positions
         x_= torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
 
         if has_cls:
