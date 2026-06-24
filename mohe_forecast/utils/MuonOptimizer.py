@@ -5,17 +5,20 @@ Muon Optimizer Setup
 """
 
 import inspect
+import re
 import torch
 import torch.nn as nn
+from torch.optim import Optimizer
 from collections import OrderedDict
 from ..model.Normalization import RMSNorm, DynamicTanh, InstanceNorm, RevIN
 
 
 
-class MultiOptimizer:
+class MultiOptimizer(Optimizer):
     """  --- WIP ---
     Lightweight wrapper that allows multiple PyTorch optimizers to be used through a single optimizer-like
-    interface. Designed for:
+    interface. It subclasses torch.optim.Optimizer so it is accepted by utilities that validate the optimizer
+    type. Designed for:
     - AdamW on embeddings, heads, biases, norms, and other non-Muon params.
     - Muon on eligible 2D hidden-layer matrices.
 
@@ -27,13 +30,20 @@ class MultiOptimizer:
     """
 
     def __init__(self, **optimizers):
-        # preserve insertion order, i.e., the flattened 'param_groups' list follows the same order.
-        self.optimizers= OrderedDict(
-            (name, opt) for name, opt in optimizers.items() if opt is not None
-        )
-        if len(self.optimizers) == 0:
+        opt_items= [(name, opt) for name, opt in optimizers.items() if opt is not None]
+        if len(opt_items) == 0:
             raise ValueError("At least one optimizer must be provided.")
+        # preserve insertion order, i.e., the flattened 'param_groups' list follows the same order.
+        self.optimizers= OrderedDict(opt_items)
 
+        # initialize the base Optimizer (state, hooks, and any version-specific attributes) with the union of
+        # all internal parameters, then replace 'param_groups' with references to the internal optimizers'
+        # own groups (_refresh_param_groups). The union is disjoint -- each parameter belongs to exactly one
+        # internal optimizer -- no-duplicate-parameter requirement
+        all_params= [
+            p for opt in self.optimizers.values() for group in opt.param_groups for p in group["params"]
+        ]
+        super().__init__(all_params, defaults={})
         self._refresh_param_groups()
 
 
@@ -61,14 +71,17 @@ class MultiOptimizer:
 
 
     def step(self, closure=None):
-        """ Perform one optimization step for every internal optimizer. """
+        """
+        Perform one optimization step for every internal optimizer. If a closure is provided it is
+        evaluated only once to (re)compute the loss and populate gradients. Targets first-order
+        optimizers (AdamW, Muon); it is not intended for closure-driven optimizers (i.e., LBFGS).
+        """
         loss= None
+        if closure is not None:
+            with torch.enable_grad():
+                loss= closure()
         for opt in self.optimizers.values():
-            # in standard AdamW/Muon training loops closure is normally None
-            if closure is None:
-                opt.step()
-            else:
-                loss= opt.step(closure)
+            opt.step()
 
         return loss
 
@@ -174,20 +187,54 @@ class MultiOptimizer:
 
 
 
+def _name_segments(name):
+    """ Split a parameter/module name into lowercase path segments on '.' and '_'. """
+    return [seg for seg in re.split(r"[._]", name.lower()) if seg]
+
+
+
+def _is_contiguous_subsequence(segments, pattern_tokens):
+    """
+    True if 'pattern_tokens' (a list of segments) appears as a contiguous run within 'segments'.
+    For single-token patterns this reduces to exact segment membership.
+    """
+    m= len(pattern_tokens)
+    if m == 0 or m > len(segments):
+        return False
+    for i in range(len(segments) - m + 1):
+        if segments[i:i + m] == pattern_tokens:
+            return True
+    return False
+
+
+
 def setup_muon_optimizer(
     model, learning_rate:float, weight_decay:float, adamw_betas=(0.9, 0.95), adamw_eps=1e-10,
     muon_momentum=0.95, muon_nesterov=True, muon_ns_coefficients=(3.4445, -4.775, 2.0315),
     muon_eps=1e-10, muon_ns_steps=5, muon_adjust_lr_fn="match_rms_adamw",
-    exclude_from_muon=("embed", "embedding", "pos_embed", "position", "pos_emb", "token", "head",
-                       "lm_head", "output", "prediction", "forecast", "decoder",),
+    exclude_from_muon=("input_norm", "embed", "embedding", "pos_embed", "position", "pos_emb", "token", "head",
+                       "lm_head", "output", "prediction", "forecast", "gating", "covariates",),
     verbose=False,
 ):
     """
-    Setup optimizer using:
-    - Muon for 2D hidden-layer weights.
-    - AdamW for all remaining parameters.
-    This method follows the intended Muon usage: hidden-layer 2D matrices are optimized by Muon,
-    while biases, norms, embeddings, and heads are optimized by AdamW.
+    Build a MultiOptimizer that applies:
+    - Muon to eligible 2D hidden-layer weight matrices.
+    - AdamW to all remaining parameters.
+
+    Scoping policy. A parameter is routed to Muon only if all the following hold: it is 2D (param.ndim == 2),
+    its name is not matched by 'exclude_from_muon', and its parent module is neither an embedding nor a
+    normalization layer. Everything else is routed to AdamW.
+
+    Name matching. 'exclude_from_muon' is matched against the '.'/'_'-delimited path segments of each parameter
+    name (case-insensitive), not as a raw substring. A single-token pattern matches when it equals a segment
+    ('head' matches '...head.weight' but not the 'head' inside 'overhead'); a multi-token pattern (e.g. 'lm_head')
+    matches only as a contiguous run of segments. Run once with verbose=True and read the printed Muon/AdamW split
+    to confirm the routing for your actual module names.
+    NOTE this is a secondary filter: embeddings and normalization layers are also caught structurally via their
+    parent module type, independent of names.
+
+    Weight-decay policy. The AdamW split is purely dimensionality-based: tensors with ndim >= 2 are weight-decayed
+    and tensors with ndim < 2 (biases, norm scales) are not.
     """
     if not hasattr(torch.optim, "Muon"):
         raise RuntimeError(
@@ -212,9 +259,12 @@ def setup_muon_optimizer(
         parent_name= param_name.rsplit(".", 1)[0]
         return named_modules.get(parent_name, None)
 
+    # tokenize the exclusion patterns once
+    exclude_token_seqs= [seq for seq in (_name_segments(p) for p in exclude_from_muon) if seq]
+
     def is_excluded_by_name(param_name):
-        lname= param_name.lower()
-        return any(key in lname for key in exclude_from_muon)
+        segments= _name_segments(param_name)
+        return any(_is_contiguous_subsequence(segments, seq) for seq in exclude_token_seqs)
 
     def is_muon_candidate(param_name, param):
         """
