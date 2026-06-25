@@ -104,7 +104,7 @@ class InstanceNorm(nn.Module):
         self.stdev= torch.sqrt(
             torch.var(x, dim=self.dim2reduce, keepdim=True, unbiased=False) + self.eps
         ).detach()
-        x /= self.stdev
+        x= x / self.stdev
 
         return x
 
@@ -137,8 +137,10 @@ class RevIN(nn.Module):
         if self.affine:
             self._init_params()
 
+
     def extra_repr(self):
         return f"num_features={self.num_features}, eps={self.eps}, elementwise_affine={self.affine}"
+
 
     def forward(self, x, mode:str):
         x= x.permute(0, 2, 1)  # (B, C, T) -> (B, T, C)
@@ -152,15 +154,18 @@ class RevIN(nn.Module):
             raise NotImplementedError
         return x.permute(0, 2, 1)  # (B, T, C) -> (B, C, T)
 
+
     def _init_params(self):
         # initialize RevIN params: (C,)
         self.affine_weight= nn.Parameter(torch.ones(self.num_features))
         self.affine_bias  = nn.Parameter(torch.zeros(self.num_features))
 
+
     def _get_statistics(self, x):
         dim2reduce= tuple(range(1, x.ndim-1))
         self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
         self.stdev= torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+
 
     def _normalize(self, x):
         x= x - self.mean
@@ -169,6 +174,7 @@ class RevIN(nn.Module):
             x= x * self.affine_weight
             x= x + self.affine_bias
         return x
+
 
     def _denormalize(self, x):
         if self.affine:

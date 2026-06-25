@@ -98,6 +98,7 @@ class Dataset_ETT(Dataset):
     - data_path (str): Name of the benchmark data (e.g., ETTh1, ETTm2, etc.)
     - from_csv (bool): False, read data from NeuralForecast. True, provide a local CSV file
     - use_time_features (bool): Default is False. Enable or disable time stamp covariates
+    - features (str): 'M' and 'MS' use every channel as both input and target. 'S' is for univariate
     - freq (str): 'h' or 'min' sampling frequency of the datapoints
     The original ETT‐style loader returns:
     - inputs: history data for training (seq_len)
@@ -113,7 +114,7 @@ class Dataset_ETT(Dataset):
                  features='MS', target='OT', scale=True, timeenc=1, use_time_features=False):
         assert data_path.lower() in ['ettm1','ettm2','etth1','etth2'], \
                 "data_path should be 'ETTm1', 'ETTm2', 'ETTh1', or 'ETTh2'"
-        assert split in ['train', 'test', 'val']
+        assert split in ['train', 'test', 'val'], "split must be one of ['train', 'test', 'val']"
         # init
         type_map= {'train': 0, 'val': 1, 'test': 2}
         self.set_type= type_map[split]
@@ -162,10 +163,15 @@ class Dataset_ETT(Dataset):
         border1= border1s[self.set_type]
         border2= border2s[self.set_type]
 
-        if self.features.lower()== 'm' or self.features.lower()== 'ms':
+        feat= self.features.lower()
+        # this model produces multivariate output (it predicts ALL input channels), so 'M' and 'MS'
+        # are equivalent here: every channel is used as both input and target. 'S' is univariate
+        if feat in ('m', 'ms'):
             cols_data= [c for c in df_raw.columns if c != 'date']
-        else:  # elif self.features.lower()== 's':
+        elif feat == 's':
             cols_data= [self.target]
+        else:
+            raise ValueError(f"features must be 'M', 'MS', or 'S'; got {self.features!r}")
         df_data= df_raw[cols_data]
 
         # scaling
@@ -179,7 +185,7 @@ class Dataset_ETT(Dataset):
             data= df_data.values
 
         # build time‐stamp features
-        df_stamp= df_raw.loc[border1:border2, ['date']].copy()
+        df_stamp= df_raw[['date']].iloc[border1:border2].copy()
         dt:pd.Series= pd.to_datetime(df_stamp['date'])
         if self.timeenc == 0:
             df_stamp['month']  = dt.dt.month
@@ -240,6 +246,7 @@ class Dataset_Custom(Dataset):
     - data_path (str): Name of the benchmark data (e.g., Weather, ECL, etc.)
     - from_csv (bool): False, read data from NeuralForecast. True, provide a local CSV file
     - use_time_features (bool): Default is False. Enable or disable time stamp covariates
+    - features (str): 'M' and 'MS' use every channel as both input and target. 'S' is for univariate
     - freq (str): 'h' or 'min' sampling frequency of the datapoints
     Returns:
     - inputs: history data for training (seq_len)
@@ -253,7 +260,7 @@ class Dataset_Custom(Dataset):
 
     def __init__(self, root_path, data_path, from_csv=True, split='train', size=None, features='MS',
                  target='OT', scale=True, timeenc=1, freq='h', use_time_features=False):
-        assert split in ['train', 'test', 'val']
+        assert split in ['train', 'test', 'val'], "split must be one of ['train', 'test', 'val']"
         # init
         type_map= {'train': 0, 'val': 1, 'test': 2}
         self.set_type= type_map[split]
@@ -304,10 +311,15 @@ class Dataset_Custom(Dataset):
         border1= border1s[self.set_type]
         border2= border2s[self.set_type]
 
-        if self.features.lower()== 'm' or self.features.lower()== 'ms':
+        feat= self.features.lower()
+        # this model produces multivariate output (it predicts ALL input channels), so 'M' and 'MS'
+        # are equivalent here: every channel is used as both input and target. 'S' is univariate
+        if feat in ('m', 'ms'):
             cols_data= [c for c in df_raw.columns if c != 'date']
-        else:  # elif self.features.lower()== 's':
+        elif feat == 's':
             cols_data= [self.target]
+        else:
+            raise ValueError(f"features must be 'M', 'MS', or 'S'; got {self.features!r}")
         df_data= df_raw[cols_data]
 
         # scaling
@@ -321,7 +333,7 @@ class Dataset_Custom(Dataset):
             data= df_data.values
 
         # build time‐stamp features
-        df_stamp= df_raw.loc[border1:border2, ['date']].copy()
+        df_stamp= df_raw[['date']].iloc[border1:border2].copy()
         dt:pd.Series= pd.to_datetime(df_stamp['date'])
         if self.timeenc == 0:
             df_stamp['month']  = dt.dt.month
