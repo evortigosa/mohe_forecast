@@ -91,8 +91,8 @@ class PatchMasking(nn.Module):
 
         B, P, C= x.size()  # (batch_size, num_patches, d_model)
         # the masked subset is chosen uniformly at random per sample via a random shuffle of patch indices
-        pto_keep= int(P * (1 - self.mask_ratio))
-        ids_shuffle= torch.rand(B, P, dtype=x.dtype, device=x.device).argsort(dim=1)
+        pto_keep= max(1, int(P * (1 - self.mask_ratio)))  # guards extreme pto_keep=0
+        ids_shuffle= torch.rand(B, P, device=x.device).argsort(dim=1)  # float32 noise
         ids_restore= torch.argsort(ids_shuffle, dim=1)
         # binary mask in shuffled order (1=mask, 0=keep): first pto_keep are kept, then unshuffle
         mask= torch.ones(B, P, dtype=x.dtype, device=x.device)
@@ -162,10 +162,10 @@ class PatchMaskingMAE(nn.Module):
 
         # ---- general path: random per-sample masking ----
         # determine the number of patches to keep
-        pto_keep= int(P * (1 - self.mask_ratio))
+        pto_keep= max(1, int(P * (1 - self.mask_ratio)))  # guards extreme pto_keep=0
         # generate random indices for masking -- noise in [0, 1]
         # ascend: small noise -> keep, large noise -> remove
-        ids_shuffle= torch.rand(B, P, dtype=x.dtype, device=x.device).argsort(dim=1)
+        ids_shuffle= torch.rand(B, P, device=x.device).argsort(dim=1)  # float32 noise
         ids_restore= torch.argsort(ids_shuffle, dim=1)
 
         # gather the first subset of the shuffled patches (the "visible" ones)
