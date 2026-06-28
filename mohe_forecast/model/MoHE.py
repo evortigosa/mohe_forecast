@@ -373,8 +373,13 @@ class MoEFeedForward(nn.Module):
         self.router_probs= self.router_dropout(F.softmax(router_logits.float() / self.router_temperature, dim=-1))
         # select top-k experts for each token (softmax scores and indices) -> (B * T, K)
         router, selected_experts= torch.topk(self.router_probs, self.top_k, dim=-1)
-        # renormalize over top-k so they sum to 1 -- keeps MoE as a convex mixture
-        router= router / router.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        if self.top_k > 1:
+            # renormalize over top-k so they sum to 1 -- keeps the MoE a convex mixture.
+            router= router / router.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            # NOTE: at top_k == 1 this normalization would collapse the weight to a constant 1.0, whose gradient 
+            # w.r.t. the router logits is exactly 0, so the task loss could not reach the router (it would only 
+            # learn from the aux load-balancing loss). We therefore keep the raw selected softmax probability at
+            # top_k == 1 so the router still receives task-loss gradient and can learn token-to-expert assignments
         # cast back to x dtype
         router= router.to(x.dtype)
 
