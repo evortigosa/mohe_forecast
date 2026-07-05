@@ -174,3 +174,92 @@ class LoadBalancingLoss:
         layer_metrics = self.compute_layerwise_metrics(router_probs, device)
 
         return loss, global_metrics, layer_metrics
+
+
+
+class LayerwiseLoadBalancingLoss(LoadBalancingLoss):
+    """
+    Auxiliary load-balancing (anti-collapse) loss for Seg-MoE, computed per layer and
+    averaged over layers.
+    """
+
+    def __init__(self, n_experts, top_k, alpha=0.02) -> None:
+        super().__init__(n_experts, top_k, alpha)
+
+
+    def _layer_term(self, probs, valid_mask):
+        """
+        Switch balancing term for ONE layer, over all its segments.
+            N * sum_i f_i * P_i,
+        with f_i the fraction of segment slots routed to expert i (hard load) and P_i the
+        mean router probability for expert i (soft load). Equals 1 when the layer is perfectly
+        balanced and N when it collapses onto a single expert.
+        - probs: [S, N] or [B', S, N]; valid_mask: optional [S]/[B', S] bool (True = keep).
+        - Returns a scalar tensor, or None if the layer has no valid segments.
+        """
+        if probs.ndim == 3:                                # [B', S, N] -> [B'*S, N]
+            probs= probs.reshape(-1, probs.size(-1))
+        if valid_mask is not None:
+            probs= probs[valid_mask.reshape(-1).bool()]
+        if probs.size(0) == 0:
+            return None
+
+        _, sel= torch.topk(probs, self.top_k, dim=-1)              # [S, K]
+        emask= F.one_hot(sel, num_classes=self.n_experts).float()  # [S, K, N]
+        f_i= emask.sum(dim=(0, 1))                                 # hard load  [N]
+        f_i= f_i / f_i.sum().clamp_min(1.0)
+        p_i= probs.mean(dim=0)                                     # soft load  [N]
+
+        return self.n_experts * torch.sum(f_i * p_i)
+
+
+    def __call__(self, router_probs, padding_mask=None, return_metrics=False, valid_masks=None):
+        """
+        - router_probs: list of per-layer router probabilities (softmax over experts), one entry
+        per Seg-MoE layer, each [B*Segs, N] (mode='layer') or [B', Segs, N] (either mode).
+        Entries may be None for non-MoE layers.
+        - padding_mask: kept for interface compatibility; must be None in this version (segment
+        padding is handled via valid_masks, not a data-validity mask).
+        return_metrics: if True, also return pooled global metrics and per-layer metrics.
+        - valid_masks: optional list (aligned with router_probs) of boolean masks marking valid
+        (non-padded) segments; None entries / None list -> use all segments
+        """
+        if padding_mask is not None:
+            raise NotImplementedError(
+                "This segment-tailored LoadBalancingLoss does not implement the data-validity "
+                "padding_mask branch (WIP). Pass padding_mask=None; use the optional valid_masks "
+                "argument to exclude right-padded segments instead."
+            )
+
+        # no MoE router probabilities -> zero aux loss. Return a Python float
+        if not isinstance(router_probs, (list, tuple)) or all(p is None for p in router_probs):
+            return 0.0, None, None
+
+        # average the per-layer Switch term over all Seg-MoE layers
+        terms= []
+        for i, probs in enumerate(router_probs):
+            if probs is None:
+                continue
+            vm= valid_masks[i] if (valid_masks is not None and i < len(valid_masks)) else None
+            term= self._layer_term(probs, vm)
+            if term is not None:
+                terms.append(term)
+
+        if len(terms) == 0:
+            return 0.0, None, None
+
+        loss= self.alpha * (torch.stack(terms).mean())
+
+        if not return_metrics:
+            return loss, None, None
+
+        # NOTE: this is a pooled view for dashboards only; the loss above is per-layer averaged, so
+        # per-layer metrics are the signal and the pooled cv/dead-expert numbers are a rough summary
+        concatenated_router_probs= self.flatten_router_probs(router_probs)
+        device= concatenated_router_probs.device
+        _, selected_experts= torch.topk(concatenated_router_probs, self.top_k, dim=-1)
+        expert_mask= F.one_hot(selected_experts, num_classes=self.n_experts).float()
+        global_metrics= self.compute_metrics(expert_mask, concatenated_router_probs, device)
+        layer_metrics = self.compute_layerwise_metrics(router_probs, device)
+
+        return loss, global_metrics, layer_metrics
