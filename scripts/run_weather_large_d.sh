@@ -2,11 +2,11 @@
 #SBATCH --job-name=d_weather_large
 #SBATCH -p segal.q
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:L40S:4
+#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:L40S:2
 #SBATCH -c 4
 #SBATCH --mem=48G
-#SBATCH --time=2:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=/home/evandro/checkpoints_mohe/logs/%x-%j.out
 #SBATCH --error=/home/evandro/checkpoints_mohe/logs/%x-%j.err
 
@@ -25,7 +25,7 @@ source /home/evandro/anaconda3/etc/profile.d/conda.sh
 conda activate torch_stable
 
 export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
-export MASTER_PORT=$((20000 + RANDOM % 20000))
+export MASTER_PORT=$((10000 + SLURM_JOB_ID % 50000))
 export WORLD_SIZE="$SLURM_NTASKS"
 
 export NCCL_IB_DISABLE=1
@@ -70,10 +70,10 @@ PY
 srun python -u -m mohe_forecast.utils.run_benchmarks --model-size large \
   --block-size 672 --patch-width 16 --width-factor 1.5 --channels 21 \
   --covariates --set exp_route_dropout=0.2 \
-  --epochs 30 --max-lr 2.8e-3 --min-lr 1.2e-4 \
+  --epochs 30 --max-lr 2.6e-3 --min-lr 1.2e-4 \
   --weight-decay 1e-4 --warmup-portion 0.1 --setup-opt \
-  --bf16 --moe-metrics --clip-grad 1.0 \
-  --devices "$WORLD_SIZE" --strategy "ddp" --precision "bf16-mixed" \
+  --clip-grad 1.0 --devices "$WORLD_SIZE" \
+  --strategy "ddp_find_unused_parameters_true" --precision "bf16-mixed" \
   --no-show-tqdm --save-plots --no-plot-cut-first \
-  --dataset-name "Weather" --no-from-csv --batch-size 96 \
+  --dataset-name "Weather" --no-from-csv --batch-size 64 \
   --verbose --checkpoint-dir "$CHECKPOINT_ROOT" --seed 50
