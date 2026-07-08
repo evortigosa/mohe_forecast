@@ -348,19 +348,20 @@ class Trainer:
         if len(all_logits) == 0:
             raise RuntimeError("No predictions were collected during test().")
 
-        preds= torch.cat(all_logits, dim=0)
-        trues= torch.cat(all_trues, dim=0)
-        indices= torch.cat(all_indices, dim=0).long()
+        preds= torch.cat(all_logits, dim=0); all_logits.clear()
+        trues= torch.cat(all_trues, dim=0);  all_trues.clear()
+        indices= torch.cat(all_indices, dim=0).long(); all_indices.clear()
         # gather sample indices too, then sort and deduplicate (may happen in distributed evaluations)
         order= torch.argsort(indices)
         indices= indices[order]
-        preds= preds[order]
-        trues= trues[order]
         # deduplicate preds and trues
         keep= torch.ones_like(indices, dtype=torch.bool)
         keep[1:]= indices[1:] != indices[:-1]
-        preds= preds[keep]
-        trues= trues[keep]
+        sel= order[keep]                       # one combined selection index
+        del order, keep, indices
+        preds= preds.index_select(0, sel)      # single copy each, originals freed on reassign
+        trues= trues.index_select(0, sel)
+        del sel
 
         return preds, trues
 
