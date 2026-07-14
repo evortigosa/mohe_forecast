@@ -348,18 +348,26 @@ class Trainer:
         if len(all_logits) == 0:
             raise RuntimeError("No predictions were collected during test().")
 
-        preds= torch.cat(all_logits, dim=0); all_logits.clear()
-        trues= torch.cat(all_trues, dim=0);  all_trues.clear()
-        indices= torch.cat(all_indices, dim=0).long(); all_indices.clear()
-        # gather sample indices too, then sort and deduplicate (may happen in distributed evaluations)
+        # order and dedup depend solely on the (small) index vector, so the final gather
+        # index can be computed before materializing preds/trues
+        indices= torch.cat(all_indices, dim=0).long()
+        all_indices.clear()
         order= torch.argsort(indices)
-        indices= indices[order]
-        # deduplicate preds and trues
+        indices= indices[order]                          # sample ids in sorted order
         keep= torch.ones_like(indices, dtype=torch.bool)
-        keep[1:]= indices[1:] != indices[:-1]
-        sel= order[keep]                       # one combined selection index
+        keep[1:]= indices[1:] != indices[:-1]            # drop duplicate ids from distributed padding
+        # sel folds sort + dedup into a single gather:
+        #   preds[order][keep] == preds[order[keep]] == preds[sel]  (same rows, same order)
+        sel= order[keep]
         del order, keep, indices
-        preds= preds.index_select(0, sel)      # single copy each, originals freed on reassign
+
+        # preds: materialize, select, and fully release its source before trues exists
+        preds= torch.cat(all_logits, dim=0)
+        all_logits.clear()
+        preds= preds.index_select(0, sel)
+        # trues: only now is it concatenated, so preds' source and trues never coexist
+        trues= torch.cat(all_trues, dim=0)
+        all_trues.clear()
         trues= trues.index_select(0, sel)
         del sel
 
@@ -405,8 +413,8 @@ class Trainer:
 
         self.model.eval()
         val_criterion= val_criterion if val_criterion is not None else nn.MSELoss(reduction='none')
-        val_loss= 0.0
-        n_samples= 0
+        val_loss= torch.tensor(0.0, device=self.device)
+        n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
 
         for batch in tqdm(self.val_loader, desc='Validating', disable=self.disable_tqdm):
             # --- minibatch construction ---
@@ -419,12 +427,12 @@ class Trainer:
                 losses= val_criterion(logits, target)
                 loss= torch.mean(losses)
 
-                val_loss += float(loss.item()) * data.size(0)
-                n_samples+= data.size(0)
+            val_loss += loss.detach().float() * data.size(0)
+            n_samples+= data.size(0)
 
-        val_loss= val_loss / max(n_samples, 1)
+        val_loss= val_loss / n_samples.clamp_min(1)
 
-        return val_loss
+        return float(val_loss.item())
 
 
     def train_one_epoch(self, epoch, clip_grad=None, get_moe_metrics=False):
@@ -506,8 +514,8 @@ class Trainer:
         assert self.device.type == 'cuda', "BF16 training requires CUDA"
 
         self.model.train()
-        train_loss= 0.0
-        n_samples= 0
+        train_loss= torch.tensor(0.0, device=self.device)
+        n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
         n_steps= 0
         epoch_lr= 0.0
 
@@ -518,6 +526,7 @@ class Trainer:
             # --- minibatch construction ---
             data, target, data_time, *_= self._get_minibatch(batch)
             padding_mask= None
+            global_metrics= layer_metrics= None
 
             # --- forward pass and get loss ---
             # model, optimizer defined as usual; model parameters kept as float32
@@ -526,9 +535,7 @@ class Trainer:
                 # compute training loss on the scaled data
                 losses= self.criterion(logits, target)
                 loss= torch.mean(losses)
-                # sample‑weighted average loss
-                train_loss += float(loss.item()) * data.size(0)
-                n_samples += data.size(0)
+                task_loss= loss.detach()  # pre-aux loss: this is what gets reported
 
                 if self.aux_criterion is not None:
                     aux_loss, global_metrics, layer_metrics= self.aux_criterion(
@@ -536,8 +543,12 @@ class Trainer:
                     )
                     loss= loss + aux_loss
 
-                    if get_moe_metrics and (self.expert_traker is not None):
-                        self.expert_traker.update(global_metrics, layer_metrics)
+            # sample-weighted average loss
+            train_loss+= task_loss.float() * data.size(0)
+            n_samples += data.size(0)
+
+            if get_moe_metrics and (self.expert_traker is not None):
+                self.expert_traker.update(global_metrics, layer_metrics)
 
             # check loss finite
             if not torch.isfinite(loss).all():
@@ -564,10 +575,10 @@ class Trainer:
         if self.augmentation is not None:
             self.augmentation.step_epoch()
 
-        train_loss= train_loss / max(n_samples, 1)
+        train_loss= train_loss / n_samples.clamp_min(1)
         epoch_lr  = epoch_lr / max(n_steps, 1)
 
-        return train_loss, epoch_lr
+        return float(train_loss.item()), epoch_lr
 
 
     def train(self, epochs, eval_interval=1, use_bf16=False, clip_grad=None, get_moe_metrics=False) -> None:
