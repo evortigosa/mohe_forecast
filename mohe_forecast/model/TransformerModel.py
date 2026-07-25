@@ -502,18 +502,15 @@ class DifferentialAttention(nn.Module):
             y= attn @ v  # (B, nh, T, dh)
         else:
             # Differential FlashAttention
+            p_drop= self.dropout.p if self.training and (self.dropout is not None) else 0.0
             q= q.reshape(B, -1, 2, T, self.d_head)
             k= k.reshape(B, -1, 2, T, self.d_head)
             # query and key matrices are split into two groups
             q1, q2= q[:, :, 0], q[:, :, 1]
             k1, k2= k[:, :, 0], k[:, :, 1]
             # compute Attention using FlashAttention kernels
-            y1= F.scaled_dot_product_attention(
-                q1, k1, v, dropout_p=self.dropout.p, is_causal=mask
-            )
-            y2= F.scaled_dot_product_attention(
-                q2, k2, v, dropout_p=self.dropout.p, is_causal=mask
-            )
+            y1= F.scaled_dot_product_attention(q1, k1, v, dropout_p=p_drop, is_causal=mask)
+            y2= F.scaled_dot_product_attention(q2, k2, v, dropout_p=p_drop, is_causal=mask)
             y= y1 - lambda_final * y2
 
         # headwise norm to maintain training stability and scale
@@ -649,9 +646,10 @@ class MultiHeadedAttention(nn.Module):
             is_causal= False if causal_mask is None else True
 
             if self.diff_attn is None:
-                y= F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.dropout.p, is_causal=is_causal
-                )
+                # scaled_dot_product_attention is a pure function: dropout_p is applied regardless of
+                # the module's training flag, so it must be gated explicitly
+                p_drop= self.dropout.p if self.training and (self.dropout is not None) else 0.0
+                y= F.scaled_dot_product_attention(q, k, v, dropout_p=p_drop, is_causal=is_causal)
             else:
                 y= self.diff_attn(q, k, v, is_causal, flash_attn)
         else:
