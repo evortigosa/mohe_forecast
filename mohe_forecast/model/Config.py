@@ -31,11 +31,11 @@ class BaseConfig:
     - drop_path (float): Default is 0.3. Defines the DropPath rate.
     - norm_type (str): Default is 'rms'. This can be 'layer', 'rms', 'dyt' (experimental).
     - diff_attn (bool): Default is False. Enables Differential Attention (experimental).
-    - ffn_type (str): Default is 'dwconv'. This can be 'mlp', 'conv', 'dwconv', 'fan'.
+    - ffn_type (str|None): Default is 'dwconv'. This can be 'mlp', 'conv', 'dwconv', 'fan'.
     - glu (bool): Default is False. Enables the Gated Linear Unit (GLU) architecture for experts.
     - n_experts (int): Default is 8. Defines the number of MoHE experts.
     - top_k_experts (int): Default is 2. Defines the number of MoHE activated experts.
-    - experts_type (str): Default is 'fan'. This can be 'mlp', 'fan'.
+    - experts_type (str|list[str]): Default is 'fan'. This can be 'mlp', 'fan', or a combination of them.
     - exp_route_dropout (float): Default is 0.1. Defines the dropout rate of expert routers.
     - exp_route_temperature (float): Default is 1.0. Controls the experts router entropy (higher temperature ->
     router is more uncertain; routing is more diverse).
@@ -75,7 +75,7 @@ class BaseConfig:
     glu:bool= False                # enables the Gated Linear Unit (GLU) architecture for experts
     n_experts:int= 8
     top_k_experts:int= 2
-    experts_type:str= 'fan'        # mlp, fan
+    experts_type:str|list[str]|tuple[str, ...]= 'fan'  # mlp, fan
     exp_route_dropout:float= 0.1   # expert gating regularization
     exp_route_temperature:float= 1.0
     output_head_type:str= 'mlp'    # mlp, conv, dwconv, fan

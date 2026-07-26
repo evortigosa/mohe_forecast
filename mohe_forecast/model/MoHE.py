@@ -284,17 +284,17 @@ class MoEFeedForward(nn.Module):
     diverse time series patterns to sparse specialized experts in a data-driven manner through a sparce router
     function (only K of N experts per token) for expert assignments.
     - When n_experts=0, forward the input into a single FFN module; MoE otherwise.
-    - ffn_type (str): defines the shared_expert type from 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for
+    - ffn_type (str|None): defines the shared_expert type from 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for
     DwConv-FFN, or 'fan' for FAN-FFN.
-    - experts_type (str): defines the routed experts from 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
+    - experts_type (str|list[str]): defines the routed experts from 'mlp' for MLP-FFN or 'fan' for FAN-FFN.
     - exp_route_temperature (float): controls the experts router entropy (higher temperature -> router is more
     uncertain; routing is more diverse).
     See https://arxiv.org/abs/2410.10469 and https://arxiv.org/abs/2409.16040
     """
 
-    def __init__(self, d_model, d_ff, dropout=0.2, ffn_type='dwconv', fan_gate=False, glu=False,
-                 n_experts=8, top_k=2, experts_type='fan', exp_route_dropout=0.1, exp_route_temperature=1.0,
-                 bias=False) -> None:
+    def __init__(self, d_model, d_ff, dropout=0.2, ffn_type:str|None='dwconv', fan_gate=False, glu=False,
+                 n_experts=8, top_k=2, experts_type:str|list[str]|tuple[str, ...]='fan', exp_route_dropout=0.1,
+                 exp_route_temperature=1.0, bias=False) -> None:
         super(MoEFeedForward, self).__init__()
         assert n_experts >= 0, "n_experts must be non-negative"
         # store router probabilities for auxiliary load-balancing regularizers (losses)

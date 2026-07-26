@@ -38,20 +38,20 @@ class TSFTransformer(nn.Module):
     and forecasting=False, we perform time-series classification.
     - norm_type (str): 'layer' for LayerNorm, 'rms' for RMSNorm, or 'dyt' for DynamicTanh.
     - If diff_attn=True, we use differential attention.
-    - MoHE. ffn_type (str): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for
-    DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str): multiple routed experts that can be 'mlp' for MLP-FFN or
-    'fan' for FAN-FFN.
+    - MoHE. ffn_type (str|None): the shared expert that can be 'mlp' for MLP-FFN, 'conv' for Conv-FFN, 'dwconv' for
+    DwConv-FFN, or 'fan' for FAN-FFN. experts_type (str|list[str]): multiple routed experts that can be 'mlp' for
+    MLP-FFN or 'fan' for FAN-FFN.
     - If rope_theta<=0, RoPE is disabled and the sinusoidal positional embedding is used.
     """
 
     def __init__(
-        self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool,
+        self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool|None,
         is_causal=False, forecasting=True, mask_ratio=0., mask_type='random', n_layer=6, d_model=256, block_size=672,
-        n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False, ffn_type='dwconv',
-        glu=False, n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0., exp_route_temperature=1.0,
-        output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0, use_input_norm=True,
-        emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False, cls_token=False,
-        c_att_mode='full'
+        n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
+        ffn_type:str|None='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type:str|list[str]|tuple[str, ...]='fan', exp_route_dropout=0.,
+        exp_route_temperature=1.0, output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
+        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False,
+        cls_token=False, c_att_mode='full'
     ) -> None:
         super(TSFTransformer, self).__init__()
         assert patch_width > 0, "patch_width must be greater than zero"
@@ -65,12 +65,20 @@ class TSFTransformer(nn.Module):
         # standardize text-based hyperparameters
         mask_type= mask_type.lower()
         norm_type= norm_type.lower()
-        ffn_type= ffn_type.lower() if isinstance(ffn_type, str) else None
-        experts_type= experts_type.lower()
         output_head_type= output_head_type.lower()
         unpatch= unpatch.lower()
         emb_norm_type= emb_norm_type.lower() if isinstance(emb_norm_type, str) else None
         c_att_mode= c_att_mode.lower()
+        ffn_type= ffn_type.lower() if isinstance(ffn_type, str) else None
+
+        if isinstance(experts_type, str):
+            normalized_experts_type= experts_type.lower()
+        elif isinstance(experts_type, (list, tuple)):
+            if not all(isinstance(expert_type, str) for expert_type in experts_type):
+                raise TypeError("Every routed expert type must be a string")
+            normalized_experts_type= [expert_type.lower() for expert_type in experts_type]
+        else:
+            raise TypeError("experts_type must be a string or a sequence of strings")
 
         self.n_outputs= int(n_outputs)
         self.is_causal= is_causal
@@ -133,7 +141,7 @@ class TSFTransformer(nn.Module):
         # define the backbone transformer model
         self.backbone= TransformerModel(
             multi_modal, is_causal, n_layer, d_model, patch_dim, n_heads, n_kv_heads, d_ff, dropout, drop_path,
-            norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts, experts_type, exp_route_dropout,
+            norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts, normalized_experts_type, exp_route_dropout,
             exp_route_temperature, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
         )
 
@@ -165,8 +173,8 @@ class TSFTransformer(nn.Module):
             self.patch_width, channels, self.n_outputs, self.width_factor, multi_modal,
             self.is_causal, self.forecasting, mask_ratio, mask_type, n_layer, d_model, self.block_size, n_heads,
             n_kv_heads, d_ff, dropout, drop_path, norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts,
-            experts_type, exp_route_dropout, exp_route_temperature, output_head_type, fine_tune, unpatch, bias,
-            rope_theta, use_input_norm, emb_norm_type, output_head_dropout, use_qk_norm, headwise_attn_gate,
+            normalized_experts_type, exp_route_dropout, exp_route_temperature, output_head_type, fine_tune, unpatch,
+            bias, rope_theta, use_input_norm, emb_norm_type, output_head_dropout, use_qk_norm, headwise_attn_gate,
             cls_token, c_att_mode
         )
 
