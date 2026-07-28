@@ -48,10 +48,10 @@ class TSFTransformer(nn.Module):
         self, patch_width:int, channels:int, n_outputs:int, width_factor:float, multi_modal:bool|None,
         is_causal=False, forecasting=True, mask_ratio=0., mask_type='random', n_layer=6, d_model=256, block_size=672,
         n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
-        ffn_type:str|None='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type:str|list[str]|tuple[str, ...]='fan', exp_route_dropout=0.,
-        exp_route_temperature=1.0, output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False, rope_theta=10000.0,
-        use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False, headwise_attn_gate=False,
-        cls_token=False, c_att_mode='full'
+        ffn_type:str|None='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type:str|list[str]|tuple[str, ...]='fan',
+        exp_route_dropout=0., exp_route_temperature=1.0, output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False,
+        rope_theta=10000.0, use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False,
+        headwise_attn_gate=False, cls_token=False, c_att_mode='full'
     ) -> None:
         super(TSFTransformer, self).__init__()
         assert patch_width > 0, "patch_width must be greater than zero"
