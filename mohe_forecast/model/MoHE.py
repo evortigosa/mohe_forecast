@@ -203,11 +203,12 @@ class FANLayer(nn.Module):
         # For the non-periodic component
         self.Wp_bar= nn.Linear(input_dim, p_bar_output_dim, bias=bias)
 
-        # normal_ presented the faster convergence for FANs
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=1.0 * float(freq_scale))
-                if m.bias is not None: nn.init.zeros_(m.bias)
+        # both projections use N(0,1): normal init on the non-periodic branch is empirically
+        # required for fast convergence, and freq_scale sets only the periodic bandwidth
+        nn.init.normal_(self.Wp.weight, mean=0.0, std=1.0 * float(freq_scale))
+        nn.init.normal_(self.Wp_bar.weight, mean=0.0, std=1.0)
+        if self.Wp.bias is not None: nn.init.zeros_(self.Wp.bias)
+        if self.Wp_bar.bias is not None: nn.init.zeros_(self.Wp_bar.bias)
 
 
     def forward(self, x):
