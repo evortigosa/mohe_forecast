@@ -10,7 +10,7 @@ from dataclasses import replace
 from .Normalization import InstanceNorm
 from .InEmbed import EmbeddingDecoderMAE
 from .TSFT import TSFTransformer
-from .Config import ModelConfig
+from .Config import ModelConfig, TinyConfig, SmallConfig, BaseConfig, LargeConfig, UltraConfig
 
 
 
@@ -57,9 +57,35 @@ class MohetsMAE(nn.Module):
         self.decoder= TSFTransformer.from_config(replace(decoder_config, **dec_overrides))
 
 
+    @property
+    def config(self):
+        """
+        The encoder config. MohetsMAE wraps two backbones, so it has no single config: the encoder is
+        the part that transfers to the downstream forecaster, so it is the one exposed here. The decoder
+        config remains available as model.decoder.config.
+        """
+        return self.encoder.config
+
+
+    @property
+    def mask_layer(self):
+        """ The mask_layer held by the encoder. """
+        return self.encoder.mask_layer
+
+
+    @property
+    def mask_ratio(self) -> float:
+        """
+        The mask ratio currently held by the encoder's masking layer.
+        NOTE: forward(ts, mask_ratio=0.75, ...) calls set_mask_ratio() on every pass, so this value
+        reflects the last forward. Always pass mask_ratio explicitly rather than relying on the default.
+        """
+        return float(self.mask_layer.mask_ratio)
+
+
     def set_mask_ratio(self, mask_ratio=0.75) -> None:
         assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
-        self.encoder.mask_layer.mask_ratio= mask_ratio
+        self.mask_layer.mask_ratio= float(mask_ratio)
 
 
     def patchify(self, ts):
@@ -82,25 +108,56 @@ class MohetsMAE(nn.Module):
         return x
 
 
-    def unpatchify(self, x):
+    def patch_stats(self, ts):
+        """
+        Per-patch mean / stdev of the RAW series: exactly the statistics forward_loss uses to build the
+        norm_pix target (same eps, same unbiased=False), so a reconstruction can be mapped back to the
+        original units without duplicating (and drifting from) that math.
+        ts:     (B, C, T)
+        p_mean: (B*C, P, 1), p_stdev: (B*C, P, 1)
+        """
+        assert self.input_norm is not None, \
+            "patch_stats is only meaningful when input_norm is enabled (norm_pix targets)"
+
+        target= self.patchify(ts)
+        p_mean = target.mean(dim=-1, keepdim=True)
+        p_stdev= torch.sqrt(target.var(dim=-1, keepdim=True, unbiased=False) + self.input_norm.eps)
+
+        return p_mean, p_stdev
+
+
+    def unpatchify(self, x, p_mean=None, p_stdev=None):
         """
         Non-learnable unpatch method. The input image is restored from patches with no learnable parameters.
         x:  (B*C, P, patch_width)
         ts: (B, C, T)
+        Two normalizations are in play and they must not be mixed up:
+        - the encoder input is instance-normalized (input_norm, stats (B, C, 1));
+        - the decoder target is per-patch normalized (norm_pix, stats (B*C, P, 1)), because forward_loss
+          normalizes each target patch by its own mean/stdev.
+        The decoder's logits therefore live in per-patch space whenever input_norm is enabled, so pass the
+        ground-truth p_mean/p_stdev (see patch_stats) to invert those stats: the result is already in raw
+        units and the instance denorm is correctly skipped. Denormalizing logits with the instance stats
+        instead is a normalization mismatch and does not reconstruct the series.
+        With input_norm disabled there is no per-patch norm, logits are raw patches, and this is a reshape.
         """
         BC, n, pw= x.size()
         p= self.encoder.t_embedding.patch_width
         assert pw == p and BC % self.channels == 0
         B= BC // self.channels
 
+        denorm_pix= (p_mean is not None) and (p_stdev is not None)
+        if denorm_pix:
+            # invert the per-patch (norm_pix) normalization (done in patch space, before the reshape)
+            x= x * p_stdev + p_mean
+
         x= x.reshape(BC, n, p, 1)  # (batch_size * channels/features, n_patches, patch_width, 1)
         x= torch.einsum('bnpc->bcnp', x)
         ts= x.reshape(B, self.channels * 1, n * p)
 
-        # denormalize the reconstructed series. NOTE: this reuses the stats stored by the most recent
-        # input_norm 'norm' call, so call unpatchify while the encoder-input stats are current (i.e.
-        # not after forward_loss, which overwrites them with per-patch stats).
-        if self.input_norm is not None:
+        # instance denorm only applies when x was in instance-normalized space: if the per-patch stats were
+        # inverted above, ts is already in raw units and denormalizing again would corrupt it.
+        if (not denorm_pix) and (self.input_norm is not None):
             ts= self.input_norm(ts, 'denorm')
 
         return ts
@@ -140,8 +197,8 @@ class MohetsMAE(nn.Module):
         mask: (BC, P) -> 0 is keep, 1 is removing
         """
         target= self.patchify(ts)
-        # per-patch target normalization (norm_pix_loss, He et al. 2021). Computed INLINE with local stats
-        # so it does NOT overwrite self.input_norm's encoder-input statistics (the [B, C, 1] stats stored
+        # per-patch target normalization (norm_pix_loss, He et al. 2021). Computed inline with local stats
+        # so it does not overwrite self.input_norm's encoder-input statistics (the [B, C, 1] stats stored
         # during forward_encoder, which unpatchify/denorm rely on). This is numerically identical to the
         # previous self.input_norm(target, 'norm') call (per-patch mean, biased variance, eps inside the sqrt)
         if self.input_norm is not None:
@@ -169,3 +226,131 @@ class MohetsMAE(nn.Module):
         loss= self.forward_loss(ts, logits, mask, criterion)  # logits -> (B*C, P, patch_width)
 
         return loss, logits, mask, enc_router, dec_router
+
+
+
+# =================================================================================================
+# MoHETS-MAE architectures
+# =================================================================================================
+# Naming follows the MAE reference implementation (He et al., facebookresearch/mae):
+#   mohets_mae_<encoder>_dec<width>d<depth>b -> encoder preset + decoder width / depth
+# e.g. mohets_mae_base_dec128d2b == Base encoder (MoHE) + a 128-dim, 2-block dense decoder.
+#
+# Design rationale
+# ----------------
+# 1. The decoder is dense (n_experts=0 -> shared expert only, no router). Two reasons:
+#    - it is discarded after pre-training, so MoE capacity there never transfers to the forecaster;
+#    - at mask_ratio=0.75 about 76% of its input tokens are copies of one learned mask vector, which
+#      makes token-level expert routing degenerate and would pollute the load-balancing statistics.
+#    MoE capacity is therefore kept where it transfers: the encoder.
+# 2. The decoder is shallow (2 blocks). He et al. found a 1-block decoder costs only ~0.1 pt of
+#    fine-tuning accuracy vs 8 blocks (decoder depth matters mainly for linear probing). This pays off
+#    more here than in ViT-MAE: the encoder sees only the visible patches (10 of 42 at mask_ratio=0.75)
+#    while the decoder runs on all 42, so a decoder block costs ~4x an encoder block of equal width.
+#    The *_dec*d4b / *_dec256d6b variants keep the preset's full depth.
+
+
+def mohets_mae_decoder_config(preset:ModelConfig, n_layer:int=2, **overrides) -> ModelConfig:
+    """
+    Build a dense (n_experts=0) MAE-decoder config from an existing preset. Only these are changed:
+    - n_layer                  : trimmed (see note 2 above);
+    - n_experts / top_k_experts: 0 -> dense shared-expert FFN, no router (MoEFeedForward skips the
+                                 routing path entirely and forwards through 'ffn_type' alone);
+    - dropout / drop_path      : 0 -> a reconstruction module needs no stochastic depth.
+    """
+    assert preset.ffn_type is not None, "ffn_type must be set when n_experts=0: it is the dense FFN"
+
+    config= replace(
+        preset, n_layer=n_layer,
+        n_experts=0, top_k_experts=0,  # dense: shared expert only, no routed experts, no router
+        dropout=0.0, drop_path=0.0,    # reconstruction module: no stochastic depth / dropout
+    )
+    return replace(config, **overrides) if overrides else config
+
+
+def _mohets_mae(encoder_config:ModelConfig, decoder_config:ModelConfig, patch_width:int=16,
+                channels:int=1, mask_ratio:float=0.75, use_input_norm:bool=True,
+                cls_token:bool=False, **encoder_overrides) -> MohetsMAE:
+    """
+    Shared builder. Extra keyword arguments are applied to the encoder config, so the backbone can
+    be tuned without rebuilding it, e.g. mohets_mae_base(channels=7, n_experts=4, drop_path=0.0).
+    """
+    if encoder_overrides:
+        encoder_config= replace(encoder_config, **encoder_overrides)
+
+    return MohetsMAE(
+        patch_width=patch_width, channels=channels, mask_ratio=mask_ratio, use_input_norm=use_input_norm,
+        cls_token=cls_token, encoder_config=encoder_config, decoder_config=decoder_config,
+    )
+
+
+# --- recommended architectures: shallow (2-block) dense decoder ----------------------------------
+
+def mohets_mae_small_dec64d2b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Small encoder (MoHE 4L/128d) + Tiny-width dense decoder (64d, 4h/2kv, 2 blocks). """
+    decoder= mohets_mae_decoder_config(TinyConfig(), 2, **(decoder_overrides or {}))
+    return _mohets_mae(SmallConfig(), decoder, **kwargs)
+
+
+def mohets_mae_base_dec128d2b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Base encoder (MoHE 6L/256d) + Small-width dense decoder (128d, 4h/2kv, 2 blocks). """
+    decoder= mohets_mae_decoder_config(SmallConfig(), 2, **(decoder_overrides or {}))
+    return _mohets_mae(BaseConfig(), decoder, **kwargs)
+
+
+def mohets_mae_large_dec128d2b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Large encoder (MoHE 8L/384d) + Small-width dense decoder (128d, 4h/2kv, 2 blocks). """
+    decoder= mohets_mae_decoder_config(SmallConfig(), 2, **(decoder_overrides or {}))
+    return _mohets_mae(LargeConfig(), decoder, **kwargs)
+
+
+def mohets_mae_ultra_dec128d2b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Ultra encoder (MoHE 12L/512d) + Small-width dense decoder (128d, 4h/2kv, 2 blocks). """
+    decoder= mohets_mae_decoder_config(SmallConfig(), 2, **(decoder_overrides or {}))
+    return _mohets_mae(UltraConfig(), decoder, **kwargs)
+
+
+def mohets_mae_ultra_dec256d2b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Ultra encoder (MoHE 12L/512d) + Base-width dense decoder (256d, 8h/4kv, 2 blocks). """
+    decoder= mohets_mae_decoder_config(BaseConfig(), 2, **(decoder_overrides or {}))
+    return _mohets_mae(UltraConfig(), decoder, **kwargs)
+
+
+# --- full-preset-depth variants: same pairings, decoder depth left at the preset's own n_layer ----
+# (untrimmed decoders; useful for linear probing / frozen-representation quality, ~2-3x decoder cost)
+
+def mohets_mae_small_dec64d4b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Small encoder + full-depth Tiny decoder (64d, 4 blocks). """
+    decoder= mohets_mae_decoder_config(TinyConfig(), 4, **(decoder_overrides or {}))
+    return _mohets_mae(SmallConfig(), decoder, **kwargs)
+
+
+def mohets_mae_base_dec128d4b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Base encoder + full-depth Small decoder (128d, 4 blocks). """
+    decoder= mohets_mae_decoder_config(SmallConfig(), 4, **(decoder_overrides or {}))
+    return _mohets_mae(BaseConfig(), decoder, **kwargs)
+
+
+def mohets_mae_large_dec128d4b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Large encoder + full-depth Small decoder (128d, 4 blocks). """
+    decoder= mohets_mae_decoder_config(SmallConfig(), 4, **(decoder_overrides or {}))
+    return _mohets_mae(LargeConfig(), decoder, **kwargs)
+
+
+def mohets_mae_ultra_dec128d4b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Ultra encoder + full-depth Small decoder (128d, 4 blocks). """
+    decoder= mohets_mae_decoder_config(SmallConfig(), 4, **(decoder_overrides or {}))
+    return _mohets_mae(UltraConfig(), decoder, **kwargs)
+
+
+def mohets_mae_ultra_dec256d6b(decoder_overrides:dict|None=None, **kwargs) -> MohetsMAE:
+    """ Ultra encoder + full-depth Base decoder (256d, 6 blocks). """
+    decoder= mohets_mae_decoder_config(BaseConfig(), 6, **(decoder_overrides or {}))
+    return _mohets_mae(UltraConfig(), decoder, **kwargs)
+
+
+# --- set recommended archs ------------------------------------------------------------------------
+mohets_mae_small= mohets_mae_small_dec64d2b   # decoder:  64 dim, 2 blocks (Tiny width)
+mohets_mae_base = mohets_mae_base_dec128d2b   # decoder: 128 dim, 2 blocks (Small width)
+mohets_mae_large= mohets_mae_large_dec128d2b  # decoder: 128 dim, 2 blocks (Small width)
+mohets_mae_ultra= mohets_mae_ultra_dec128d2b  # decoder: 128 dim, 2 blocks (Small width)

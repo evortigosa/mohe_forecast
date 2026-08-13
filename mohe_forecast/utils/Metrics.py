@@ -187,3 +187,55 @@ def eval_forecast_horizons(trainer_obj, data_name, test_loader_96=None, test_loa
         return float("nan"), float("nan")
 
     return np.mean(avg_mse).item(), np.mean(avg_mae).item()
+
+
+
+def eval_reconstruction_quality(trainer_obj, data_name, test_loader, mask_ratio=None,
+                                masked_out=True, inverse_transform=False, chunk_size=None):
+    """
+    Evaluate an SSL / MAE model by masked reconstruction and return (MSE, MAE).
+    Sibling of eval_forecast_horizons, but for the reconstruction objective: there is no forecast
+    horizon, so a single test loader is scored (the SSL factory builds one reconstruction loader,
+    size_te = [block, block, 0]).
+    - masked_out=True (default) scores only the masked positions -- the true MAE objective -- via
+    MaeTrainer.test(masked_out=True), which returns preds/trues already restricted to those
+    positions and mapped back to raw units.
+    - masked_out=False scores the full reconstructed series (comparable to how the random-mask
+    SSL path is currently evaluated).
+    """
+    trainer_obj._print(f"\n{data_name}")
+    trainer_obj._print("\nReconstruction quality" + (" (masked positions only)" if masked_out else " (full series)"))
+
+    # must run on all ranks (collectives inside test())
+    preds, trues= trainer_obj.test(
+        test_loader, inverse_transform=inverse_transform, mask_ratio=mask_ratio, masked_out=masked_out
+    )
+
+    if not trainer_obj._is_main_process():
+        return None, None
+    if preds is None or trues is None:
+        raise RuntimeError("Main process received None preds or labels from trainer.test().")
+
+    mse_metric= MSEMetric(init_val=0.0)
+    mae_metric= MAEMetric(init_val=0.0)
+
+    if chunk_size is None:
+        mse_metric.push(trues, preds)
+        mae_metric.push(trues, preds)
+    else:
+        mse, mae= chunked_mse_mae(trues, preds, int(chunk_size))
+        mse_metric.value= mse
+        mae_metric.value= mae
+
+    print(mse_metric)
+    print(mae_metric)
+    trainer_obj._barrier()
+
+    # MSEMetric/MAEMetric.value is a 0-dim tensor (non-chunked path) or a python float (chunked path);
+    # return plain floats either way, mirroring eval_forecast_horizons' np.mean(...).item().
+    mse_val= mse_metric.value
+    mae_val= mae_metric.value
+    mse_val= float(mse_val.item()) if hasattr(mse_val, "item") else float(mse_val)
+    mae_val= float(mae_val.item()) if hasattr(mae_val, "item") else float(mae_val)
+
+    return mse_val, mae_val
