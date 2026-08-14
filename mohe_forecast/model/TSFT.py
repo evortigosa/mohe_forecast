@@ -284,7 +284,7 @@ class TSFTransformer(nn.Module):
 
 
     @torch.inference_mode()
-    def forecast(self, ts, ts_mark=None, ts_mark_future=None, dynamic_window=True):
+    def forecast(self, ts, ts_mark=None, ts_mark_future=None, dynamic_window=True, flash_attn=True):
         """
         Perform autoregressive forecasting until get the forecast horizon.
         - dynamic_window (bool) defines the windowing policy. Forecasted tokens are attached to ts and forwarded to the
@@ -325,7 +325,7 @@ class TSFTransformer(nn.Module):
                     if ts_mark is not None:
                         ts_mark= ts_mark[:, :, rem:]
 
-                logits, *_= self.forward(ts, ts_mark=ts_mark, flash_attn=False)
+                logits, *_= self.forward(ts, ts_mark=ts_mark, flash_attn=flash_attn)
                 if end_f_patch_width > 0:
                     future= logits[:, :, -f_patch_width:-end_f_patch_width]
                 else:
