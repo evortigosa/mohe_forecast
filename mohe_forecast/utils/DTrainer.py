@@ -135,13 +135,87 @@ class DTrainer(Trainer):
             self.fabric.clip_gradients(self.model, self.optimizer, max_norm=clip_grad)
 
 
+    def _reduce_moe_stats(self, metric_dicts):
+        """
+        Reduce a list of per-rank MoE-metric dicts across ranks and recompute the derived quantities
+        from the global sufficient statistics. All dicts are packed into a single tensor so the whole
+        list is reduced with one all-reduce (one sync point), regardless of how many MoE layers there are.
+        - Why recompute instead of averaging: hard_fraction / soft_fraction are per-expert normalizations,
+        entropy is a mean over tokens, dead_experts is a global zero-count, and the CVs are std/mean --
+        all nonlinear in the local statistics, so averaging the per-rank derived values is wrong (e.g. an
+        expert that is idle on one rank but busy on another would be miscounted as partially "dead").
+        The additive sufficient statistics (token_counts, prob_mass, num_tokens, and the entropy
+        numerator = entropy * num_tokens) sum cleanly across ranks; every derived metric is then rebuilt
+        with the exact formulas used in LoadBalancingLoss.compute_metrics, so world_size == 1 reproduces
+        the single-device result bit-for-bit.
+        """
+        if len(metric_dicts) == 0:
+            return []
+
+        dev= self.device
+        # pack the additive sufficient statistics of every dict into one [D, 2E+2] tensor
+        rows= []
+        for m in metric_dicts:
+            tc= m["token_counts"].to(dev).flatten().float()   # [E] hard slot counts
+            pm= m["prob_mass"].to(dev).flatten().float()      # [E] soft probability mass
+            nt= m["num_tokens"].to(dev).reshape(1).float()    # [1] token (row) count
+            en= m["entropy"].to(dev).reshape(1).float() * nt  # [1] entropy numerator (mean * count)
+            rows.append(torch.cat([tc, pm, nt, en], dim=0))
+        packed= torch.stack(rows, dim=0)                      # [D, 2E+2], identical shape on every rank
+
+        # the only collective: sum the sufficient statistics across ranks
+        packed= self._reduce_sum(packed)
+        # unpack and rebuild every derived metric from the global sufficient statistics
+        reduced= []
+        for row in packed:
+            e= (row.numel() - 2) // 2
+            g_tc= row[:e]                                     # global token_counts [E]
+            g_pm= row[e:2 * e]                                # global prob_mass    [E]
+            g_nt= row[2 * e]                                  # global num_tokens   (scalar)
+            g_en= row[2 * e + 1]                              # global entropy numerator (scalar)
+
+            hard_fraction= g_tc / g_tc.sum().clamp_min(1.0)
+            soft_fraction= g_pm / g_pm.sum().clamp_min(1e-12)
+            reduced.append({
+                "hard_fraction": hard_fraction,
+                "soft_fraction": soft_fraction,
+                "token_counts": g_tc,
+                "prob_mass": g_pm,
+                "entropy": g_en / g_nt.clamp_min(1.0),
+                "dead_experts": (g_tc == 0).sum(),
+                "cv_hard": hard_fraction.std(unbiased=False) / hard_fraction.mean().clamp_min(1e-12),
+                "cv_soft": soft_fraction.std(unbiased=False) / soft_fraction.mean().clamp_min(1e-12),
+                "num_tokens": g_nt,
+            })
+        return reduced
+
+
     def _reduce_moe_metrics(self, metrics):
         """
-        Aggregate MoE routing diagnostics across distributed ranks. Reduce the sufficient statistics
-        (token_counts, prob_mass, num_tokens) and recompute all derived quantities globally.
-        - TODO: This is a WIP.
+        Aggregate MoE routing diagnostics across distributed ranks. Reduces the sufficient statistics
+        (token_counts, prob_mass, num_tokens, entropy numerator) and recomputes every derived quantity
+        globally. Handles both structures the base trainer passes in:
+        - the flat global-metrics dict, and
+        - the per-layer {layer_id: metrics_dict} mapping (reduced in a single collective).
+        The structure/None branching depends only on the model architecture (which is identical on every
+        rank), never on data values, so all ranks always issue the same collectives in the same order.
         """
-        return metrics
+        # nothing to reduce for no-MoE steps or single-process runs; also avoids issuing a collective
+        # (returning the input unchanged matches the base-class no-op exactly for world_size == 1)
+        if metrics is None or self.fabric.world_size == 1:
+            return metrics
+
+        # per-layer mapping {layer_id: metrics_dict}: reduce every layer together in one all-reduce
+        # (an empty mapping -- e.g. a model with no MoE layers -- issues no collective on any rank)
+        if all(isinstance(v, dict) for v in metrics.values()):
+            if len(metrics) == 0:
+                return metrics
+            layer_ids= sorted(metrics.keys())  # sorted -> identical order on all ranks
+            reduced= self._reduce_moe_stats([metrics[i] for i in layer_ids])
+            return {i: r for i, r in zip(layer_ids, reduced)}
+
+        # flat global-metrics dict
+        return self._reduce_moe_stats([metrics])[0]
 
 
     def _save(self, state_file, state_path):
@@ -154,7 +228,11 @@ class DTrainer(Trainer):
 
     def train(self, *args, **kwargs) -> None:
         """
-        - TODO: get_moe_metrics=True
+        Distributed training entry point. Precision is delegated to Fabric (so use_bf16 is forced off
+        for the base loop).
+        - get_moe_metrics: when enabled, the per-step routing diagnostics are aggregated across ranks
+        by the _reduce_moe_metrics override before being tracked, so the ExpertUsageTracker on every
+        rank holds the correct global statistics.
         """
         finfo= (
             f"accelerator={self.fabric.accelerator.__class__.__name__.replace('Accelerator', '').lower()}, "
@@ -164,5 +242,4 @@ class DTrainer(Trainer):
         self._set_log("info", f"train | Fabric {finfo}")
 
         kwargs["use_bf16"]= None  # not necessary, fabric handles precision
-        kwargs["get_moe_metrics"]= False
         super().train(*args, **kwargs)
