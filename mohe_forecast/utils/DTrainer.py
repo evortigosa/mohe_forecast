@@ -39,6 +39,8 @@ class DTrainer(Trainer):
 
 
     def _set_loader(self, loader):
+        if loader.__class__.__name__ == "_FabricDataLoader":   # already wrapped
+            return loader
         return self.fabric.setup_dataloaders(loader, move_to_device=False)
 
 
