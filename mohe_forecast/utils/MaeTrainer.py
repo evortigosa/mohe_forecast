@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Time-Series Forecasting Transformer (TSFT) with Mixture-of-Heterogeneous-Experts (MoHE)
-MaeTrainer Class -- SSL MAE training for MohetsMAE.
+MaeTrainer Class -- SSL MAE (distributed) training for MohetsMAE.
 """
 
 import time
@@ -9,6 +9,7 @@ import torch
 from contextlib import contextmanager
 from tqdm import tqdm
 from .Trainer import Trainer
+from .DTrainer import DTrainer
 
 
 
@@ -437,3 +438,82 @@ class MaeTrainer(Trainer):
         epoch_lr  = epoch_lr / max(n_steps, 1)
 
         return float(train_loss.item()), epoch_lr
+
+
+
+class MaeDTrainer(DTrainer, MaeTrainer):
+    """
+    Distributed SSL MAE training for MohetsMAE using Lightning Fabric machinery.
+
+    --- Why this class is (almost) empty ---
+    MaeTrainer overrides only the SSL logic (train_one_epoch, the two validate variants, test, and
+    __init__), and every one of those methods is written against the Trainer hook contract
+    (_move_to_device, _backward, _reduce_sum, _gather_variable_batch, _is_main_process, _set_loader,
+    _unwrap_model, _reduce_moe_metrics). DTrainer overrides exactly those hooks -- and nothing MaeTrainer
+    touches. The two parents therefore override disjoint method sets, and cooperative inheritance
+    composes them with no glue code:
+
+        MaeDTrainer -> DTrainer -> MaeTrainer -> Trainer     (the MRO)
+
+    - distribution hooks, _setup, checkpoint IO (_save/_load) ......... resolve to DTrainer
+    - SSL loops, masked test(), _frozen_eval_rng, MAE __init__ ........ resolve to MaeTrainer
+    - the epoch loop, early stopping, checkpointing, plots ............ inherited from Trainer
+    - train() ......................................................... DTrainer's wrapper: it logs the
+      Fabric setup, forces use_bf16=None (Fabric owns precision), then falls through the MRO to
+      Trainer.train, whose self.train_one_epoch / self.validate dispatch to the MAE loops.
+
+    The __init__ chain is: MaeDTrainer(fabric, **kwargs) -> DTrainer.__init__ -> MaeTrainer.__init__
+    (which consumes the MAE-specific kwargs) -> Trainer.__init__; then, back in DTrainer.__init__,
+    _setup() swaps self.device for fabric.device and wraps the model, optimizer and loaders. When
+    MaeTrainer.__init__ resolves mask_ratio via _unwrap_model(), _bare_model does not exist yet and the
+    hook falls back to the still-bare CPU module, which is exactly the right object to read it from.
+
+    --- Usage contract (same as DTrainer) ---
+    Build the model, optimizer and loaders on CPU after fabric.launch(), and pass device='cpu' (it is
+    replaced by fabric.device during _setup). The MAE-specific arguments (dec_aux_criterion, mask_ratio,
+    eval_mask_ratio, deterministic_eval, eval_seed) travel through **kwargs to MaeTrainer, and the
+    criterion must be element-wise (reduction='none'), as in the single-device MaeTrainer.
+
+    --- Distributed notes specific to the MAE ---
+    - Deterministic evaluation still holds per rank: _frozen_eval_rng seeds every rank with the same
+      eval_seed, and the val/test samplers are not shuffled, so each rank scores its own fixed shard
+      under identical masks every epoch. The reduced val loss is therefore deterministic, and early
+      stopping and per-epoch comparisons stay paired. Comparisons across runs are paired as long as the
+      world size is unchanged (re-sharding the data realigns which mask lands on which sample).
+    - Masks travel through the gather as uint8 (bool all_gather is backend-dependent); test() upcasts
+      back to bool on the main rank only.
+    - The collective schedule is data-independent: masked_out is a uniform call argument, the finite
+      check all-reduces on every step, and the per-batch gather order inside test() is fixed, so all
+      ranks always issue the same collectives in the same order.
+    - test() returns (None, None) on non-main ranks -- Metrics.eval_reconstruction_quality already
+      guards for that, and must be called on all ranks (there are collectives inside test()).
+    """
+
+    def __init__(self, fabric, **kwargs) -> None:
+        super().__init__(fabric, **kwargs)
+
+
+    def train_one_epoch_bf16(self, *args, **kwargs):
+        """
+        The manual-autocast loop is a single-device tool: it performs no cross-rank reductions, so under
+        world_size > 1 it would silently report per-rank losses. Precision under Fabric belongs to the
+        Fabric(precision=...) plugin with the standard train_one_epoch; train() already routes there.
+        """
+        if self.fabric.world_size > 1:
+            raise RuntimeError(
+                "train_one_epoch_bf16 is single-device: use Fabric(precision='bf16-mixed') with the "
+                "standard training loop instead (train() already forces use_bf16=None)."
+            )
+        return super().train_one_epoch_bf16(*args, **kwargs)
+
+
+    def validate_bf16(self, *args, **kwargs):
+        """
+        Single-device only, for the same reason as train_one_epoch_bf16 (no cross-rank reductions).
+        """
+        if self.fabric.world_size > 1:
+            raise RuntimeError(
+                "validate_bf16 is single-device: use Fabric(precision='bf16-mixed') with the standard "
+                "validate() instead."
+            )
+        return super().validate_bf16(*args, **kwargs)
