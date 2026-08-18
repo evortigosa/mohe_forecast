@@ -234,7 +234,7 @@ class FANFeedForward(nn.Module):
     """
 
     def __init__(self, d_model, d_ff, n_outputs=None, dropout=0.2, fan_gate=False, glu=False,
-                 bias=False, freq_scale=1.0) -> None:
+                 bias=False, freq_scale=1.0, final_linear=False) -> None:
         super(FANFeedForward, self).__init__()
         # FAN up layer
         self.up_fan= FANLayer(d_model, d_ff, fan_gate, bias=bias, freq_scale=freq_scale)
@@ -247,14 +247,21 @@ class FANFeedForward(nn.Module):
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
         # FAN down layer
         self.down_fan= FANLayer(d_ff, d_model, fan_gate, bias=bias, freq_scale=freq_scale)
-        # Final projection when n_outputs is not None
+
         if isinstance(n_outputs, int) and (n_outputs != d_model):
+            # Final projection when n_outputs is not None
             self.WL= nn.Linear(d_model, n_outputs, bias=bias)
+        elif final_linear:
+            # Final projection when n_outputs is None and final_linear=True
+            self.WL= nn.Linear(d_model, d_model, bias=bias)
+        else:
+            # No final projection
+            self.WL= None
+            
+        if self.WL is not None:
             # initialize the Linear module with Glorot / fan_avg
             nn.init.xavier_uniform_(self.WL.weight)
             if self.WL.bias is not None: nn.init.zeros_(self.WL.bias)
-        else:
-            self.WL= None
 
 
     def forward(self, x):
