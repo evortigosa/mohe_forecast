@@ -703,7 +703,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, multi_modal, depth, d_model=384, block_size=672, n_heads=12, n_kv_heads=6, d_ff=768,
                  dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False, ffn_type='dwconv', glu=False,
                  n_experts=8, top_k_experts=2, experts_type='fan', exp_route_dropout=0.1, exp_route_temperature=1.0,
-                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False, c_att_mode='full') -> None:
+                 bias=False, rope_theta=10000.0, use_qk_norm=False, headwise_attn_gate=False, c_att_mode='full',
+                 is_causal=False) -> None:
         super(TransformerBlock, self).__init__()
 
         # Self-Attention module to endogenous series
@@ -729,7 +730,7 @@ class TransformerBlock(nn.Module):
         self.norm3= self.get_norm(norm_type, d_model, init_alpha=0.2)
         self.ffn  = MoEFeedForward(
             d_model, d_ff, dropout, ffn_type, False, glu, n_experts, top_k_experts, experts_type,
-            exp_route_dropout, exp_route_temperature, bias
+            exp_route_dropout, exp_route_temperature, bias, is_causal
         )
         self.drop_path3= DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
@@ -801,7 +802,7 @@ class TransformerModel(nn.Module):
             TransformerBlock(
                 multi_modal, depth, d_model, block_size, n_heads, n_kv_heads, d_ff, dropout, sdp_rates[depth],
                 norm_type, diff_attn, ffn_type, glu, n_experts, top_k_experts, experts_type, exp_route_dropout,
-                exp_route_temperature, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode
+                exp_route_temperature, bias, rope_theta, use_qk_norm, headwise_attn_gate, c_att_mode, is_causal
             ) for depth in range(n_layer)
         ])
         # final normalization layer after the last TransformerBlock
@@ -822,6 +823,18 @@ class TransformerModel(nn.Module):
         else:
             # no causal mask when TransformerModel is an Encoder
             self.causal_mask= None
+
+
+    def set_causal_ffn(self, is_causal:bool) -> None:
+        """
+        Flip the shared DwConv expert between causal (left-padded) and centred padding in every
+        block, so switch_model_type keeps the FFN consistent with the attention mask. No parameter
+        shapes change, so this is safe on a loaded checkpoint.
+        """
+        for block in self.transformer:
+            shared= getattr(block.ffn, "shared_expert", None)
+            if hasattr(shared, "set_causal"):
+                shared.set_causal(is_causal)
 
 
     def forward(self, x, x_cross, inference, flash_attn=True):

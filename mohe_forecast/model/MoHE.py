@@ -123,13 +123,25 @@ class DwConvFeedForward(nn.Module):
     gating mechanism, and the SiLU activation is applied only on the pw_conv branch before performing
     an element-wise multiplication with the gating features.
     - This module can switch between a GLU-based DwConvFFN and a DwConvFFN based on the glu flag.
+    - is_causal=False keeps the original symmetric padding (output[t] sees t-1, t, t+1).
+    - is_causal=True pads on the left only (output[t] sees t-k+1 ... t), which is required whenever the
+    backbone is a Decoder: with symmetric padding this conv leaks one patch of future per layer, so an
+    'is_causal' model is not actually causal, and no past token is ever final (which also makes
+    KV caching invalid). Parameter shapes are identical either way (a checkpoint loads under both
+    settings) but the computed function differs, so a trained model must be re-trained/re-validated
+    before causal switch.
     """
 
-    def __init__(self, d_model, d_ff, n_outputs=None, dropout=0.2, glu=False, bias=False) -> None:
+    def __init__(self, d_model, d_ff, n_outputs=None, dropout=0.2, glu=False, bias=False,
+                 kernel_size=3, is_causal=False) -> None:
         super(DwConvFeedForward, self).__init__()
+        self.is_causal= bool(is_causal)
+        self.kernel_size= int(kernel_size)
+        self.left_pad= self.kernel_size - 1
         # Up-Conv -- Shared depthwise separable convolution (applied along the time dimension)
         self.dw_conv= nn.Conv1d(
-            d_model, d_model, kernel_size=3, stride=1, padding=1, groups=d_model, bias=bias
+            d_model, d_model, kernel_size=self.kernel_size, stride=1, groups=d_model, bias=bias,
+            padding=0 if self.is_causal else (self.kernel_size // 2)
         )
         # Up-Conv -- Pointwise convolution (expansion)
         self.pw_conv= nn.Conv1d(d_model, d_ff, kernel_size=1, stride=1, padding=0, bias=bias)
@@ -155,8 +167,19 @@ class DwConvFeedForward(nn.Module):
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
 
+    def set_causal(self, is_causal:bool) -> None:
+        """
+        Flip the padding mode in place (no parameter change), so switch_model_type can turn the
+        shared expert causal/non-causal together with the backbone.
+        """
+        self.is_causal= bool(is_causal)
+        self.dw_conv.padding= (0,) if self.is_causal else (self.kernel_size // 2,)
+
+
     def forward(self, x):
         x= x.permute(0, 2, 1)  # (B, T, C) -> (B, C, T)
+        if self.is_causal:
+            x= F.pad(x, (self.left_pad, 0))
         # gate only the expansion step, otherwise the gate is forced to learn a direct mapping
         x= self.dw_conv(x)
         # apply GLU activation when glu=True
@@ -302,7 +325,7 @@ class MoEFeedForward(nn.Module):
 
     def __init__(self, d_model, d_ff, dropout=0.2, ffn_type:str|None='dwconv', fan_gate=False, glu=False,
                  n_experts=8, top_k=2, experts_type:str|list[str]|tuple[str, ...]='fan', exp_route_dropout=0.1,
-                 exp_route_temperature=1.0, bias=False) -> None:
+                 exp_route_temperature=1.0, bias=False, is_causal=False) -> None:
         super(MoEFeedForward, self).__init__()
         assert n_experts >= 0, "n_experts must be non-negative"
         # store router probabilities for auxiliary load-balancing regularizers (losses)
@@ -311,7 +334,8 @@ class MoEFeedForward(nn.Module):
         # shared fallback expert -- ensures no token is unprocessed if its top-k experts happen
         # to be poorly trained or overflowed
         self.shared_expert= (
-            self.get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias) if ffn_type is not None else None
+            self.get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias, is_causal)
+            if ffn_type is not None else None
         )
 
         if n_experts == 0:
@@ -351,11 +375,13 @@ class MoEFeedForward(nn.Module):
 
 
     @staticmethod
-    def get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias):
+    def get_ffn(ffn_type, d_model, d_ff, dropout, fan_gate, glu, bias, is_causal=False):
         if ffn_type == 'conv':
             return ConvFeedForward(d_model, d_ff, None, dropout, glu, bias)
         elif ffn_type == 'dwconv':
-            return DwConvFeedForward(d_model, d_ff, None, dropout, glu, bias)
+            # the DwConv shared expert is the only temporal mixer in MoHE: FAN/MLP/Conv(1x1) experts
+            # are position-wise, and the routed experts are applied to flattened tokens
+            return DwConvFeedForward(d_model, d_ff, None, dropout, glu, bias, is_causal=is_causal)
         elif ffn_type == 'mlp':
             return FeedForward(d_model, d_ff, None, dropout, glu, bias)
         else:

@@ -200,7 +200,7 @@ class IntTemporalEmbedding(nn.Module):
     - C must be at least 4 (month, day, weekday, hour) and optional 5th feature -> minute.
     """
 
-    def __init__(self, out_channels, d_model, minute_size=4):
+    def __init__(self, out_channels, d_model, minute_size=4) -> None:
         super(IntTemporalEmbedding, self).__init__()
         # cardinalities of each calendar feature [month, day, weekday, hour, (minute)]
         month_size  = 13
@@ -214,7 +214,7 @@ class IntTemporalEmbedding(nn.Module):
         self.weekday_embed= nn.Embedding(weekday_size, d_model)
         self.hour_embed   = nn.Embedding(hour_size, d_model)
         self.minute_embed = nn.Embedding(minute_size, d_model)
-        # # project concatenated time features from 5*d_model to out_channels
+        # project concatenated time features from 5*d_model to out_channels
         self.proj_time= nn.Linear(5*d_model, out_channels, bias=False)
         # fuse the concatenated 2*out_channels time/data embedding to out_channels
         self.fuse= nn.Linear(2*out_channels, out_channels, bias=False)
@@ -264,17 +264,20 @@ class ContTemporalEmbeddingV3(nn.Module):
     - C must be at least 4 (hour, weekday, day, month) and optional 5th feature -> minute.
     """
 
-    def __init__(self, out_channels, d_model):
+    def __init__(self, out_channels, d_model, is_causal:bool=False) -> None:
         super(ContTemporalEmbeddingV3, self).__init__()
         # expected C = 5 for [minute, hour, weekday, day, month]
         time_channels= 5
 
-        # project raw data channels to d_model
-        self.proj_data= nn.Linear(out_channels, d_model, bias=False)
+        if not is_causal:
+            # project raw data channels to d_model
+            self.proj_data= nn.Linear(out_channels, d_model, bias=False)
+        else:
+            self.proj_data= None
         # project time features to d_model
         self.proj_time= nn.Linear(time_channels, d_model, bias=False)
         # fuse the concatenated 2*d_model time/data embedding to out_channels
-        self.fuse= nn.Linear(2*d_model, out_channels, bias=False)
+        self.fuse= nn.Linear((1 if is_causal else 2)*d_model, out_channels, bias=False)
 
         # initialize Linear modules with Glorot / fan_avg
         for m in self.modules():
@@ -293,11 +296,13 @@ class ContTemporalEmbeddingV3(nn.Module):
             minute= torch.zeros(B, 1, T, device=x_mark.device, dtype=x_mark.dtype) -0.50
             x_mark= torch.cat([minute, x_mark], dim=1)
 
-        x     = self.proj_data(x.permute(0, 2, 1))       # (B, T, d_model)
         x_mark= self.proj_time(x_mark.permute(0, 2, 1))  # (B, T, d_model)
-
-        te= torch.cat([x, x_mark], dim=-1)  # (B, T, 2*d_model)
-        te= self.fuse(te)                   # (B, T, C)
+        if self.proj_data is None:
+            te= self.fuse(x_mark)                        # (B, T, C)
+        else:
+            x= self.proj_data(x.permute(0, 2, 1))        # (B, T, d_model)
+            te= torch.cat([x, x_mark], dim=-1)           # (B, T, 2*d_model)
+            te= self.fuse(te)                            # (B, T, C)
         # fuse time embeddings -- now we can then patchify
         return te.permute(0, 2, 1)  # (B, C, T)
 
@@ -312,19 +317,22 @@ class ContTemporalEmbedding(nn.Module):
     - C must be at least 4 (hour, weekday, day, month) and optional 5th feature -> minute.
     """
 
-    def __init__(self, out_channels, d_model):
+    def __init__(self, out_channels, d_model, is_causal:bool=False) -> None:
         super(ContTemporalEmbedding, self).__init__()
         # expected C = 5 for [minute, hour, weekday, day, month]
         time_channels= 5
         # project to the highest dim to avoid bottlenecks
         d_hidden= max(time_channels, out_channels, d_model)
 
-        # project raw data channels to d_hidden
-        self.proj_data= nn.Linear(out_channels, d_hidden, bias=False)
+        if not is_causal:
+            # project raw data channels to d_hidden
+            self.proj_data= nn.Linear(out_channels, d_hidden, bias=False)
+        else:
+            self.proj_data= None
         # project time features to d_hidden
         self.proj_time= nn.Linear(time_channels, d_hidden, bias=False)
         # fuse the concatenated 2*d_hidden time/data embedding to out_channels
-        self.fuse= nn.Linear(2*d_hidden, out_channels, bias=False)
+        self.fuse= nn.Linear((1 if is_causal else 2)*d_hidden, out_channels, bias=False)
 
         # initialize Linear modules with Glorot / fan_avg
         for m in self.modules():
@@ -343,11 +351,13 @@ class ContTemporalEmbedding(nn.Module):
             minute= torch.zeros(B, 1, T, device=x_mark.device, dtype=x_mark.dtype) -0.50
             x_mark= torch.cat([minute, x_mark], dim=1)
 
-        x     = self.proj_data(x.permute(0, 2, 1))       # (B, T, d_hidden)
         x_mark= self.proj_time(x_mark.permute(0, 2, 1))  # (B, T, d_hidden)
-
-        te= torch.cat([x, x_mark], dim=-1)  # (B, T, 2*d_hidden)
-        te= self.fuse(te)                   # (B, T, C)
+        if self.proj_data is None:
+            te= self.fuse(x_mark)                        # time marks only -- no endogenous leak
+        else:
+            x= self.proj_data(x.permute(0, 2, 1))        # (B, T, d_hidden)
+            te= torch.cat([x, x_mark], dim=-1)           # (B, T, 2*d_hidden)
+            te= self.fuse(te)                            # (B, T, C)
         # fuse time embeddings -- now we can then patchify
         return te.permute(0, 2, 1)  # (B, C, T)
 
@@ -360,7 +370,8 @@ class PatchEmbeddingV3(nn.Module):
     - v3: uses RMSNorm as the normalization layer.
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2, ch_independence=True) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, ch_independence=True,
+                 norm_type='rms') -> None:
         super(PatchEmbeddingV3, self).__init__()
         self.patch_width= patch_width
         self.d_model= d_model
@@ -371,7 +382,7 @@ class PatchEmbeddingV3(nn.Module):
             self.channels, d_model, kernel_size=patch_width, stride=patch_width, bias=False
         )
         # define normalization and dropout modules for regularization
-        self.norm= RMSNorm(d_model)
+        self.norm= RMSNorm(d_model) if norm_type == 'rms' else nn.LayerNorm(d_model)
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
 
         # initialize Conv modules with Glorot / fan_avg
@@ -424,7 +435,8 @@ class PatchEmbedding(nn.Module):
         )
         # define normalization and dropout modules for regularization
         self.norm= nn.GroupNorm(num_groups=1, num_channels=d_model)
-        # single group, equivalent with a LayerNorm
+        # single group -> normalizes over channels and patches (d_model x num_patches) per sample,
+        # i.e. window-dependent statistics
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
 
         # initialize Conv modules with Glorot / fan_avg
@@ -467,12 +479,13 @@ class MultiModalEmbedding(nn.Module):
     learning.
     """
 
-    def __init__(self, patch_width, out_channels, d_model, dropout=0.2, norm_type='group') -> None:
+    def __init__(self, patch_width, out_channels, d_model, dropout=0.2, norm_type='group',
+                 is_causal=False) -> None:
         super(MultiModalEmbedding, self).__init__()
 
-        self.covariates= ContTemporalEmbedding(out_channels, d_model)
-        if norm_type == 'rms':
-            self.patchfy= PatchEmbeddingV3(patch_width, out_channels, d_model, dropout)
+        self.covariates= ContTemporalEmbedding(out_channels, d_model, is_causal=is_causal)
+        if norm_type == 'rms' or is_causal:
+            self.patchfy= PatchEmbeddingV3(patch_width, out_channels, d_model, dropout, norm_type=norm_type)
         else:
             self.patchfy= PatchEmbedding(patch_width, out_channels, d_model, dropout)
 

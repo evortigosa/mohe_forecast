@@ -44,7 +44,7 @@ class OutputBlock(nn.Module):
     """
 
     def __init__(self, forecasting, d_model, d_ff, n_outputs, dropout=0.2, ffn_type='mlp', bias=False,
-                 fine_tune=False) -> None:
+                 fine_tune=False, is_causal=False) -> None:
         super(OutputBlock, self).__init__()
         # in fine_tune mode we have only a simplified projection head -- see ViT
         if fine_tune:
@@ -60,7 +60,7 @@ class OutputBlock(nn.Module):
             if ffn_type == 'conv' and forecasting:
                 self.out_proj= ConvFeedForward(d_model, d_ff, n_outputs, dropout, glu=False, bias=bias)
             elif ffn_type == 'dwconv' and forecasting:
-                self.out_proj= DwConvFeedForward(d_model, d_ff, n_outputs, dropout, glu=False, bias=bias)
+                self.out_proj= DwConvFeedForward(d_model, d_ff, n_outputs, dropout, glu=False, bias=bias, is_causal=is_causal)
             elif ffn_type == 'fan':
                 self.out_proj= FANFeedForward(
                     d_model, d_ff, n_outputs, dropout, fan_gate=False, glu=False, bias=bias
@@ -83,7 +83,8 @@ class UnPatchV3(nn.Module):
     See https://arxiv.org/abs/2201.03545
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False, ch_independence=True) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False, ch_independence=True,
+                 is_causal=False) -> None:
         super(UnPatchV3, self).__init__()
         assert d_model % patch_width == 0, "d_model must be divisible by patch_width"
         self.channels= channels
@@ -93,7 +94,15 @@ class UnPatchV3(nn.Module):
         # calculate kernel_size and padding of the depthwise conv based on patch_width
         dks= min(max(((patch_width // 2) - 1), 1), 7)  # [1, 7]
         dks= dks - 1 if dks % 2 == 0 else dks
-        dpd= dks // 2
+        # The ConvTranspose1d is non-overlapping (kernel=stride=patch_width), so each patch decodes
+        # into its own patch_width samples -- safe. The depthwise conv that follows runs over the
+        # upsampled sample axis, and with symmetric padding (dpd= dks//2) output sample t reads
+        # sample t+dpd, which at a patch boundary belongs to the next patch. Under is_causal that
+        # is a future leak on exactly the samples the forecast is read from. causal=True left-pads
+        # instead; parameter shapes are unchanged
+        self.is_causal= bool(is_causal)
+        self.left_pad= (dks - 1) if self.is_causal else 0
+        dpd= 0 if self.is_causal else (dks // 2)
 
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
         self.unpatch= nn.Sequential(
@@ -126,8 +135,17 @@ class UnPatchV3(nn.Module):
         if self.dropout is not None:
             x= self.dropout(x)
         # upsample and decode the patch embeddings
-        x = x.permute(0, 2, 1)  # (B, P, C) -> (B, C, P)
-        ts= self.unpatch(x)
+        x= x.permute(0, 2, 1)  # (B, P, C) -> (B, C, P)
+        if self.is_causal:
+            # left-pad at the sample level: the ConvTranspose1d expands patches by patch_width, so
+            # the pad is applied after upsampling, inside the sequential, via a functional pad here
+            ts= self.unpatch[0](x)             # ConvTranspose1d -> samples
+            ts= self.unpatch[1](ts)            # GELU
+            ts= F.pad(ts, (self.left_pad, 0))  # causal left pad before the depthwise conv
+            for layer in self.unpatch[2:]:
+                ts= layer(ts)
+        else:
+            ts= self.unpatch(x)
         # ts -> (batch_size * channels/features, 1, seq_length)
         ts= ts.reshape(-1, self.channels, ts.size(-1))
         # ts -> (batch_size, channels/features, seq_length)
@@ -143,7 +161,8 @@ class UnPatch(nn.Module):
     See https://arxiv.org/abs/2201.03545
     """
 
-    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False, ch_independence=True) -> None:
+    def __init__(self, patch_width, channels, d_model, dropout=0.2, bias=False, ch_independence=True,
+                 is_causal=False) -> None:
         super(UnPatch, self).__init__()
         assert d_model % 4 == 0, "d_model must be divisible by 4"
         self.channels= channels
@@ -152,7 +171,15 @@ class UnPatch(nn.Module):
         # calculate kernel_size and padding of the depthwise conv based on patch_width
         dks= min(max(((patch_width // 2) - 1), 1), 7)  # [1, 7]
         dks= dks - 1 if dks % 2 == 0 else dks
-        dpd= dks // 2
+        # The ConvTranspose1d is non-overlapping (kernel=stride=patch_width), so each patch decodes
+        # into its own patch_width samples -- safe. The depthwise conv that follows runs over the
+        # upsampled sample axis, and with symmetric padding (dpd= dks//2) output sample t reads
+        # sample t+dpd, which at a patch boundary belongs to the next patch. Under is_causal that
+        # is a future leak on exactly the samples the forecast is read from. causal=True left-pads
+        # instead; parameter shapes are unchanged
+        self.is_causal= bool(is_causal)
+        self.left_pad= (dks - 1) if self.is_causal else 0
+        dpd= 0 if self.is_causal else (dks // 2)
 
         self.dropout= nn.Dropout(p=dropout) if dropout > 0.0 else None
         self.unpatch= nn.Sequential(
@@ -184,8 +211,17 @@ class UnPatch(nn.Module):
         if self.dropout is not None:
             x= self.dropout(x)
         # upsample and decode the patch embeddings
-        x = x.permute(0, 2, 1)  # (B, P, C) -> (B, C, P)
-        ts= self.unpatch(x)
+        x= x.permute(0, 2, 1)  # (B, P, C) -> (B, C, P)
+        if self.is_causal:
+            # left-pad at the sample level: the ConvTranspose1d expands patches by patch_width, so
+            # the pad is applied after upsampling, inside the sequential, via a functional pad here
+            ts= self.unpatch[0](x)             # ConvTranspose1d -> samples
+            ts= self.unpatch[1](ts)            # GELU
+            ts= F.pad(ts, (self.left_pad, 0))  # causal left pad before the depthwise conv
+            for layer in self.unpatch[2:]:
+                ts= layer(ts)
+        else:
+            ts= self.unpatch(x)
         # ts -> (batch_size * channels/features, 1, seq_length)
         ts= ts.reshape(-1, self.channels, ts.size(-1))
         # ts -> (batch_size, channels/features, seq_length)
@@ -290,14 +326,11 @@ class DecoderHead(nn.Module):
     """
 
     def __init__(self, patch_width, n_patches, channels, d_model, d_ff, n_outputs, dropout=0.2,
-                 head_type='mlp', bias=False, fine_tune=False, unpatch='conv', ch_independence=True) -> None:
+                 head_type='mlp', bias=False, fine_tune=False, ch_independence=True) -> None:
         super(DecoderHead, self).__init__()
         # decoder projection head
-        self.d_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune)
-        if unpatch == 'linear':
-            self.unpatch= LinearUnPatch(n_patches, channels, d_model, n_outputs, dropout, bias, ch_independence)
-        else:
-            self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias, ch_independence)
+        self.d_head= OutputBlock(True, d_model, d_ff, d_model, dropout, head_type, bias, fine_tune, is_causal=True)
+        self.unpatch= UnPatch(patch_width, channels, d_model, dropout, bias, ch_independence, is_causal=True)
 
 
     def forward(self, x):

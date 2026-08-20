@@ -50,7 +50,7 @@ class TSFTransformer(nn.Module):
         n_heads=8, n_kv_heads=4, d_ff=512, dropout=0.2, drop_path=0.3, norm_type='rms', diff_attn=False,
         ffn_type:str|None='dwconv', glu=False, n_experts=8, top_k_experts=2, experts_type:str|list[str]|tuple[str, ...]='fan',
         exp_route_dropout=0., exp_route_temperature=1.0, output_head_type='mlp', fine_tune=True, unpatch='conv', bias=False,
-        rope_theta=10000.0, use_input_norm=True, emb_norm_type='layer', output_head_dropout=0., use_qk_norm=False,
+        rope_theta=10000.0, use_input_norm=True, emb_norm_type='group', output_head_dropout=0., use_qk_norm=False,
         headwise_attn_gate=False, cls_token=False, c_att_mode='full'
     ) -> None:
         super(TSFTransformer, self).__init__()
@@ -99,20 +99,25 @@ class TSFTransformer(nn.Module):
         use_input_norm = use_input_norm and (emb_norm_type is not None) and not (mask_ratio > 0.0 and mask_type == 'mae')
         self.input_norm= InstanceNorm(dim2reduce=-1, eps=1e-5) if use_input_norm else None
         #self.input_norm= RevIN(channels, eps=1e-5) if use_input_norm else None
+        if self.is_causal:
+            assert not use_input_norm, \
+                "InstanceNorm reduces over time; its statistics would include the next-patch targets"
+            assert emb_norm_type in ('rms', 'layer'), \
+                "GroupNorm patch embedding normalises across patches (future included)"
 
         # define the patch embedding for converting TS tokens
         if emb_norm_type is None:
             self.t_embedding= nn.Identity()  # enable custom, external input embeddings
-        elif emb_norm_type == 'rms':
-            self.t_embedding= PatchEmbeddingV3(self.patch_width, channels, d_model, dropout)
+        elif emb_norm_type == 'rms' or self.is_causal:
+            self.t_embedding= PatchEmbeddingV3(self.patch_width, channels, d_model, dropout, norm_type=emb_norm_type)
         else:
             self.t_embedding= PatchEmbedding(self.patch_width, channels, d_model, dropout)
         # define the patch embedding for exogenous covariates
         if multi_modal is None:
             self.c_embedding= nn.Identity()  # enable custom, external covariate embeddings
         elif multi_modal:
-            emb_norm_type= 'layer' if emb_norm_type is None else emb_norm_type
-            self.c_embedding= MultiModalEmbedding(self.patch_width, channels, d_model, dropout, emb_norm_type)
+            c_norm= 'group' if emb_norm_type is None else emb_norm_type
+            self.c_embedding= MultiModalEmbedding(self.patch_width, channels, d_model, dropout, c_norm, self.is_causal)
         else:
             self.c_embedding= None
 
@@ -153,7 +158,7 @@ class TSFTransformer(nn.Module):
         if is_causal:
             self.head= DecoderHead(
                 self.patch_width, patch_dim, channels, d_model, d_ff, self.block_size, output_head_dropout,
-                output_head_type, bias, fine_tune, unpatch
+                output_head_type, bias, fine_tune
             )
         else:
             if self.mask_layer is not None:
@@ -230,6 +235,9 @@ class TSFTransformer(nn.Module):
             self.mask_layer = None
 
         self.backbone.def_causal_mask(self.is_causal, flash_attn)
+        # keep the shared DwConv expert consistent with the attention mask: a centred conv in a causal
+        # model leaks one patch of future per layer
+        self.backbone.set_causal_ffn(self.is_causal)
         self.set_horizon()
 
         return f"Model type switched to is_causal={self.is_causal}"
@@ -474,8 +482,8 @@ class TSFTransformer(nn.Module):
             optim_groups, lr=learning_rate, betas=betas, eps=1e-10, fused=use_fused
         )
         if verbose:
-            print(f"[INFO] Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params} parameters")
-            print(f"[INFO] Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params} parameters")
+            print(f"[INFO] Num decayed parameter tensors: {len(decay_params):,}, with {num_decay_params:,} parameters")
+            print(f"[INFO] Num non-decayed parameter tensors: {len(nodecay_params):,}, with {num_nodecay_params:,} parameters")
             print(f"[INFO] Using fused AdamW: {use_fused}")
 
         return optimizer
