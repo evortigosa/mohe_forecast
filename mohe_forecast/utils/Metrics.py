@@ -207,9 +207,12 @@ def eval_reconstruction_quality(trainer_obj, data_name, test_loader, mask_ratio=
     trainer_obj._print("\nReconstruction quality" + (" (masked positions only)" if masked_out else " (full series)"))
 
     # must run on all ranks (collectives inside test())
-    preds, trues= trainer_obj.test(
-        test_loader, inverse_transform=inverse_transform, mask_ratio=mask_ratio, masked_out=masked_out
-    )
+    if mask_ratio is None:
+        preds, trues= trainer_obj.test(test_loader, inverse_transform=inverse_transform)
+    else:
+        preds, trues= trainer_obj.test(
+            test_loader, inverse_transform=inverse_transform, mask_ratio=mask_ratio, masked_out=masked_out
+        )
 
     if not trainer_obj._is_main_process():
         return None, None
