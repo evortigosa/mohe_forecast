@@ -214,31 +214,31 @@ def eval_reconstruction_quality(trainer_obj, data_name, test_loader, mask_ratio=
             test_loader, inverse_transform=inverse_transform, mask_ratio=mask_ratio, masked_out=masked_out
         )
 
-    if not trainer_obj._is_main_process():
-        return None, None
-    if preds is None or trues is None:
-        raise RuntimeError("Main process received None preds or labels from trainer.test().")
+    mse_val= mae_val= None
+    if trainer_obj._is_main_process():
+        if preds is None or trues is None:
+            raise RuntimeError("Main process received None preds or labels from trainer.test().")
 
-    mse_metric= MSEMetric(init_val=0.0)
-    mae_metric= MAEMetric(init_val=0.0)
+        mse_metric= MSEMetric(init_val=0.0)
+        mae_metric= MAEMetric(init_val=0.0)
 
-    if chunk_size is None:
-        mse_metric.push(trues, preds)
-        mae_metric.push(trues, preds)
-    else:
-        mse, mae= chunked_mse_mae(trues, preds, int(chunk_size))
-        mse_metric.value= mse
-        mae_metric.value= mae
+        if chunk_size is None:
+            mse_metric.push(trues, preds)
+            mae_metric.push(trues, preds)
+        else:
+            mse, mae= chunked_mse_mae(trues, preds, int(chunk_size))
+            mse_metric.value= mse
+            mae_metric.value= mae
 
-    print(mse_metric)
-    print(mae_metric)
+        print(mse_metric)
+        print(mae_metric)
+
+        # MSEMetric/MAEMetric.value is a 0-dim tensor (non-chunked path) or a python float
+        # (chunked path); return plain floats either way
+        v= mse_metric.value; mse_val= float(v.item()) if hasattr(v, "item") else float(v)
+        v= mae_metric.value; mae_val= float(v.item()) if hasattr(v, "item") else float(v)
+
+    # all ranks, mirroring eval_forecast_horizons
     trainer_obj._barrier()
-
-    # MSEMetric/MAEMetric.value is a 0-dim tensor (non-chunked path) or a python float (chunked path);
-    # return plain floats either way, mirroring eval_forecast_horizons' np.mean(...).item().
-    mse_val= mse_metric.value
-    mae_val= mae_metric.value
-    mse_val= float(mse_val.item()) if hasattr(mse_val, "item") else float(mse_val)
-    mae_val= float(mae_val.item()) if hasattr(mae_val, "item") else float(mae_val)
 
     return mse_val, mae_val
