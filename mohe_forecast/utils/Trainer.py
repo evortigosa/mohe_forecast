@@ -8,6 +8,7 @@ import os
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+import gc
 import torch
 import torch.nn as nn
 import logging
@@ -664,10 +665,10 @@ class Trainer:
             self._set_log("info", f"train | Best Validation Loss: %.6f | Epoch: %d" % (best_val_loss, best_epoch+1))
             # Save a final checkpoint only if the last epoch equals the best epoch.
             if best_epoch == epochs - 1 and self.checkpointing:
-                self.save_checkpoint(best_epoch, best_val_loss)
+                self.save_checkpoint(best_epoch, best_val_loss, save_optimizer=True)
 
 
-    def save_checkpoint(self, epoch, best_val_loss) -> None:
+    def save_checkpoint(self, epoch, best_val_loss, save_optimizer=False) -> None:
         """
         Save the model checkpoint to disk, including training history.
         - save expert tracker (if not None): traker_path is {checkpoint_path}_expert_traker.pt
@@ -680,26 +681,42 @@ class Trainer:
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'config': asdict(model.config),
-            'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': best_val_loss,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'lr_hist': self.lr_hist,
             'timestamp': time.time(),
         }
+        # the optimizer state is optional and dominates both the file size and the peak host RAM
+        has_optimizer= bool(save_optimizer) and (getattr(self, "optimizer", None) is not None)
+        if save_optimizer and not has_optimizer:
+            self._set_log("warning",
+                "save_checkpoint | save_optimizer=True but self.optimizer is None: saving model only."
+            )
+        if has_optimizer:
+            checkpoint['optimizer_state_dict']= self.optimizer.state_dict()
+        checkpoint['has_optimizer']= has_optimizer
+
+        if self.scheduler is not None and hasattr(self.scheduler, "state_dict"):
+            checkpoint['scheduler_state_dict']= self.scheduler.state_dict()
+
         try:
+            # release anything reclaimable before the largest allocation of the run
+            gc.collect()
             self._save(checkpoint, checkpoint_path)
             # (optional) save full expert tracker history in a separate file
             if self.expert_traker is not None:
                 traker_path= self.get_checkpoint_path(f'{self.filename}_expert_traker.pt', self.checkpoint_dir)
                 self._save(self.expert_traker.state_dict(compact=True), traker_path)
             self._set_log(
-                "info", f"save_checkpoint | epoch=%d | best_val_loss=%.6f | saved at %s" % \
-                 (epoch+1, best_val_loss, checkpoint_path)
+                "info", f"save_checkpoint | epoch=%d | best_val_loss=%.6f | optimizer=%s | saved at %s" % \
+                 (epoch+1, best_val_loss, "yes" if has_optimizer else "no", checkpoint_path)
             )
         except Exception as e:
             self._set_log("error", f"save_checkpoint | Failed to save checkpoint: {e}")
             raise e
+        finally:
+            del checkpoint
 
 
     @staticmethod
@@ -745,14 +762,48 @@ class Trainer:
                         "load_checkpoint | restore_optimizer=True but self.optimizer is None: skipping optimizer."
                     )
                 elif "optimizer_state_dict" not in checkpoint:
-                    self._set_log("warning",
-                        "load_checkpoint | restore_optimizer=True but optimizer_state_dict is missing: skipping optimizer."
-                    )
+                    if checkpoint.get("has_optimizer") is False:
+                        self._set_log("warning",
+                            "load_checkpoint | restore_optimizer=True but this checkpoint was saved with "
+                            "save_optimizer=False: resuming with fresh Adam moments."
+                        )
+                    else:
+                        self._set_log("warning",
+                            "load_checkpoint | restore_optimizer=True but optimizer_state_dict is missing "
+                            "(older or truncated checkpoint): skipping optimizer."
+                        )
                 else:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     self._set_optimizer()
-                    if self.scheduler is not None:
-                        self.scheduler.optimizer= self.optimizer
+            # restore the LR schedule progress
+            if restore_optimizer and (self.scheduler is not None) and (getattr(self, "optimizer", None) is not None):
+                sched_state= checkpoint.get('scheduler_state_dict', None)
+                if sched_state is None:
+                    self._set_log("warning",
+                        "load_checkpoint | restore_optimizer=True but scheduler_state_dict is missing: "
+                        "the LR schedule restarts from step 0 (warmup will run again)."
+                    )
+                elif not hasattr(self.scheduler, "load_state_dict"):
+                    self._set_log("warning",
+                        "load_checkpoint | scheduler has no load_state_dict: skipping schedule restore."
+                    )
+                else:
+                    self.scheduler.optimizer= self.optimizer
+                    mismatched= self.scheduler.load_state_dict(sched_state)
+                    if mismatched:
+                        deltas= ", ".join(
+                            f"{k}: checkpoint={sched_state[k]} current={getattr(self.scheduler, k)}"
+                            for k in mismatched
+                        )
+                        self._set_log("warning",
+                            f"load_checkpoint | scheduler config differs from the checkpoint ({deltas}); "
+                            "keeping the current configuration -- the LR trajectory will not match the original run."
+                        )
+                    last_lr= getattr(self.scheduler, "last_lr", None)
+                    self._set_log("info",
+                        "load_checkpoint | scheduler restored at step %d (lr=%s)" % \
+                        (self.scheduler.last_step, "N/A" if last_lr is None else "%.4e" % last_lr)
+                    )
 
             # retrieve training metadata
             epoch= checkpoint.get("epoch", 0)

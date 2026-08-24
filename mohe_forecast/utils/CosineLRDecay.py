@@ -14,6 +14,11 @@ class CosineLRDecay:
     - Call .step() after each batch (i.e. every optimizer step).
     """
 
+    # the schedule shape: changing any of these changes the LR trajectory
+    _CONFIG_KEYS= ("min_lr", "max_lr", "warmup_steps", "max_steps")
+    # the mutable progress of the schedule
+    _STATE_KEYS= ("last_step", "last_lr")
+
     def __init__(self, optimizer, min_lr, max_lr, warmup_steps=10, max_steps=50) -> None:
         assert warmup_steps < max_steps, "warmup_steps must be less than max_steps"
         self.optimizer= optimizer
@@ -23,6 +28,9 @@ class CosineLRDecay:
         self.max_steps= int(max_steps)
         self.last_step= 0
         self.last_lr= None
+
+        assert all(hasattr(self, k) for k in (*self._STATE_KEYS, *self._CONFIG_KEYS)), \
+            "state/config key names must match the attributes set in __init__"
 
 
     def extra_repr(self):
@@ -58,3 +66,47 @@ class CosineLRDecay:
             param_group['lr']= self.last_lr
 
         self.last_step += 1
+
+
+    def state_dict(self) -> dict:
+        """
+        Serializable scheduler state. The optimizer is deliberately excluded: it is saved separately
+        and re-bound on load, exactly as torch.optim.lr_scheduler does.
+        - the progress counters are what must be restored to continue a run;
+        - the configuration is stored for validation only, so that resuming against a different
+        schedule shape is reported rather than silently changing the LR trajectory.
+        """
+        return {k: getattr(self, k) for k in (*self._STATE_KEYS, *self._CONFIG_KEYS)}
+
+
+    def load_state_dict(self, state_dict:dict, restore_config=False) -> list:
+        """
+        Restore the schedule progress.
+        - restore_config=False (default): keep this instance's configuration and restore only the
+        counters, so a deliberate change (e.g. resuming with more epochs -> larger max_steps) is
+        honoured. Differing keys are returned so the caller can log them.
+        - restore_config=True: also adopt the checkpointed configuration, for an exact continuation.
+        Returns the list of configuration keys that differ from the checkpoint.
+        """
+        missing= [k for k in self._STATE_KEYS if k not in state_dict]
+        if missing:
+            raise KeyError(f"CosineLRDecay.load_state_dict | missing keys: {missing}")
+
+        mismatched= [
+            k for k in self._CONFIG_KEYS if k in state_dict and state_dict[k] != getattr(self, k)
+        ]
+        if restore_config:
+            for k in self._CONFIG_KEYS:
+                if k in state_dict:
+                    setattr(self, k, state_dict[k])
+            assert self.warmup_steps < self.max_steps, "warmup_steps must be less than max_steps"
+
+        self.last_step= int(state_dict["last_step"])
+        self.last_lr= state_dict["last_lr"]
+        # re-apply the checkpointed LR so the optimizer is consistent before the next step(),
+        # which matters when the optimizer state itself was not restored
+        if self.last_lr is not None and self.optimizer is not None:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr']= self.last_lr
+
+        return mismatched
