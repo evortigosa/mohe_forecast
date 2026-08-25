@@ -650,7 +650,7 @@ class Trainer:
                     best_val_loss= val_loss
                     best_epoch= epoch
                     if self.checkpointing:
-                        self.save_checkpoint(epoch, best_val_loss)
+                        self.save_checkpoint(epoch, best_val_loss, save_optimizer=True)
 
                 if self.early_stopping is not None:
                     # watches the current validation loss and halts if it hasn't improved within patience
@@ -732,7 +732,8 @@ class Trainer:
         return state_dict
 
 
-    def load_checkpoint(self, filename=None, checkpoint_dir=None, restore_optimizer=False, restore_metadata=False) -> tuple:
+    def load_checkpoint(self, filename=None, checkpoint_dir=None, restore_optimizer=False, restore_scheduler=False,
+                        restore_metadata=False) -> tuple:
         """
         This method loads the checkpoint from the given path and restores the model, optimizer
         (optional, when restore_optimizer=True), and training history (optional, when restore_metadata=True).
@@ -775,20 +776,30 @@ class Trainer:
                 else:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     self._set_optimizer()
-            # restore the LR schedule progress
-            if restore_optimizer and (self.scheduler is not None) and (getattr(self, "optimizer", None) is not None):
+            # restore the LR schedule progress, independently of the optimizer: with save_optimizer=False a checkpoint
+            # carries the schedule but no moments, and resuming the schedule is still the right thing to do
+            if restore_scheduler:
                 sched_state= checkpoint.get('scheduler_state_dict', None)
-                if sched_state is None:
+                if getattr(self, "optimizer", None) is None:
                     self._set_log("warning",
-                        "load_checkpoint | restore_optimizer=True but scheduler_state_dict is missing: "
-                        "the LR schedule restarts from step 0 (warmup will run again)."
+                        "load_checkpoint | restore_scheduler=True but self.optimizer is None: skipping "
+                        "(the scheduler writes the LR into optimizer.param_groups)."
+                    )
+                elif self.scheduler is None:
+                    self._set_log("warning",
+                        "load_checkpoint | restore_scheduler=True but self.scheduler is None: skipping."
                     )
                 elif not hasattr(self.scheduler, "load_state_dict"):
                     self._set_log("warning",
                         "load_checkpoint | scheduler has no load_state_dict: skipping schedule restore."
                     )
+                elif sched_state is None:
+                    self._set_log("warning",
+                        "load_checkpoint | restore_scheduler=True but scheduler_state_dict is missing: "
+                        "the LR schedule restarts from step 0 (warmup will run again)."
+                    )
                 else:
-                    self.scheduler.optimizer= self.optimizer
+                    self.scheduler.optimizer= self.optimizer   # re-bind before the LR is re-applied
                     mismatched= self.scheduler.load_state_dict(sched_state)
                     if mismatched:
                         deltas= ", ".join(
