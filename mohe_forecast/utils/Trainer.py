@@ -381,7 +381,7 @@ class Trainer:
         Validate the model on a validation set.
         """
         self.model.eval()
-        val_criterion= val_criterion if val_criterion is not None else nn.MSELoss(reduction='none')
+        val_criterion= self.criterion if val_criterion is None else val_criterion
         val_loss= torch.tensor(0.0, device=self.device)
         n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
         p_bar= self.disable_tqdm or not self._is_main_process()
@@ -413,7 +413,7 @@ class Trainer:
         assert self.device.type == 'cuda', "BF16 training requires CUDA"
 
         self.model.eval()
-        val_criterion= val_criterion if val_criterion is not None else nn.MSELoss(reduction='none')
+        val_criterion= self.criterion if val_criterion is None else val_criterion
         val_loss= torch.tensor(0.0, device=self.device)
         n_samples= torch.tensor(0, device=self.device, dtype=torch.long)
 
