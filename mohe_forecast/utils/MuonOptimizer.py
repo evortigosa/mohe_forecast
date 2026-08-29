@@ -6,6 +6,7 @@ Muon Optimizer Setup
 
 import inspect
 import re
+import warnings
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -35,6 +36,11 @@ class MultiOptimizer(Optimizer):
             raise ValueError("At least one optimizer must be provided.")
         # preserve insertion order, i.e., the flattened 'param_groups' list follows the same order.
         self.optimizers= OrderedDict(opt_items)
+        # construction-time base LR of every group, in flattened order. This is the schedule's
+        # reference ('initial_lr' for CosineLRDecay and every torch.optim.lr_scheduler).
+        self._base_lrs= [
+            float(group["lr"]) for opt in self.optimizers.values() for group in opt.param_groups
+        ]
 
         # initialize the base Optimizer (state, hooks, and any version-specific attributes) with the union of
         # all internal parameters, then replace 'param_groups' with references to the internal optimizers'
@@ -52,16 +58,25 @@ class MultiOptimizer(Optimizer):
         self.param_groups= []
         self.param_group_names= []
         self.param_group_to_optimizer= []
+        ref_lr= self._base_lrs[0]
+        idx= 0
 
         for opt_name, opt in self.optimizers.items():
             for group_idx, group in enumerate(opt.param_groups):
-                # store metadata directly in the parameter-group dictionary
-                group.setdefault("optimizer_name", opt_name)
-                group.setdefault("group_name", f"{opt_name}/group_{group_idx}")
+                # assigned, not setdefault: these derive from the current construction and must
+                # survive Optimizer.load_state_dict rebuilding the group dicts from a checkpoint
+                group["optimizer_name"]= opt_name
+                group["group_name"]= f"{opt_name}/group_{group_idx}"
+                group["initial_lr"]= self._base_lrs[idx]                              # drives the schedule
+                group["lr_scale"]= (self._base_lrs[idx] / ref_lr) if ref_lr else 1.0  # reporting only
                 # append references, not copies
                 self.param_groups.append(group)
                 self.param_group_names.append(group["group_name"])
                 self.param_group_to_optimizer.append(opt_name)
+                idx += 1
+
+        assert self.param_groups[0].get("lr_scale", 1.0) == 1.0, \
+            "the first flattened group must be the LR reference"
 
 
     def zero_grad(self, set_to_none=True):
@@ -84,26 +99,6 @@ class MultiOptimizer(Optimizer):
             opt.step()
 
         return loss
-
-
-    def state_dict(self):
-        """ Return a checkpointable state dictionary for all internal optimizers. """
-        return {
-            "optimizers": {name: opt.state_dict() for name, opt in self.optimizers.items()},
-            "param_group_names": self.param_group_names,
-        }
-
-
-    def load_state_dict(self, state_dict):
-        """ Load the state of each internal optimizer. """
-        opt_states= state_dict["optimizers"]
-
-        for name, opt_state in opt_states.items():
-            if name not in self.optimizers:
-                raise KeyError(f"Optimizer '{name}' not found in current MultiOptimizer.")
-            self.optimizers[name].load_state_dict(opt_state)
-        # rebuild flattened references after loading
-        self._refresh_param_groups()
 
 
     def get_lrs(self):
@@ -182,11 +177,72 @@ class MultiOptimizer(Optimizer):
                 "betas": group.get("betas", None),
                 "momentum": group.get("momentum", None),
                 "nesterov": group.get("nesterov", None),
+                "lr_scale": group.get("lr_scale", None),
             }
         return summary
 
 
+    def state_dict(self):
+        """ Return a checkpointable state dictionary for all internal optimizers. """
+        return {
+            "optimizers": {name: opt.state_dict() for name, opt in self.optimizers.items()},
+            "param_group_names": list(self.param_group_names),
+            "base_lrs": list(self._base_lrs),
+        }
 
+
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load the state of each internal optimizer.
+        - strict=True (default): every internal optimizer must have saved state and the flattened
+        group layout must match the checkpoint. A partial restore is refused rather than silently
+        leaving an optimizer's momentum / second-moment buffers at zero.
+        - strict=False: restore what matches; returns the names that were not restored.
+        """
+        if "optimizers" not in state_dict:
+            raise KeyError("MultiOptimizer.load_state_dict | malformed state: missing 'optimizers'.")
+        opt_states= state_dict["optimizers"]
+
+        unknown= [n for n in opt_states if n not in self.optimizers]
+        missing= [n for n in self.optimizers if n not in opt_states]
+        if unknown:
+            raise KeyError(
+                f"MultiOptimizer.load_state_dict | checkpoint defines optimizer(s) {unknown} not "
+                f"present here (current: {list(self.optimizers)})."
+            )
+        if missing and strict:
+            raise KeyError(
+                f"MultiOptimizer.load_state_dict | no saved state for {missing}: their momentum / "
+                f"second-moment buffers would restart from zero. Pass strict=False to accept that."
+            )
+        # the inner load_state_dict validates group sizes; comparing names first turns a routing
+        # change into an actionable error instead of an opaque size mismatch
+        saved_names= state_dict.get("param_group_names", None)
+        if saved_names is not None and list(saved_names) != list(self.param_group_names):
+            raise ValueError(
+                "MultiOptimizer.load_state_dict | parameter-group layout differs from the checkpoint "
+                f"(checkpoint={list(saved_names)}, current={list(self.param_group_names)}): the "
+                "routing policy changed, so the saved state does not describe these groups."
+            )
+        # a deliberate LR change on resume is legitimate; announce it instead of inferring it
+        saved_bases= state_dict.get("base_lrs", None)
+        if saved_bases is not None and list(saved_bases) != list(self._base_lrs):
+            warnings.warn(
+                f"MultiOptimizer.load_state_dict | base LR policy changed "
+                f"(checkpoint={list(saved_bases)}, current={list(self._base_lrs)}); keeping the "
+                f"current configuration.", stacklevel=2
+            )
+
+        for name, opt_state in opt_states.items():
+            self.optimizers[name].load_state_dict(opt_state)
+        # rebuild flattened references (re-asserts optimizer_name / group_name / initial_lr / lr_scale)
+        self._refresh_param_groups()
+
+        return missing
+
+
+
+# ----------------------------------------------------------------------------------------
 def _name_segments(name):
     """ Split a parameter/module name into lowercase path segments on '.' and '_'. """
     return [seg for seg in re.split(r"[._]", name.lower()) if seg]
@@ -211,7 +267,7 @@ def _is_contiguous_subsequence(segments, pattern_tokens):
 def setup_muon_optimizer(
     model, learning_rate:float, weight_decay:float, adamw_betas=(0.9, 0.95), adamw_eps=1e-10,
     muon_momentum=0.95, muon_nesterov=True, muon_ns_coefficients=(3.4445, -4.775, 2.0315),
-    muon_eps=1e-10, muon_ns_steps=5, muon_adjust_lr_fn="match_rms_adamw",
+    muon_eps=1e-10, muon_ns_steps=5, muon_adjust_lr_fn="match_rms_adamw", muon_lr_scale=1.0,
     exclude_from_muon=("input_norm", "embed", "embedding", "pos_embed", "position", "pos_emb", "token", "head",
                        "lm_head", "output", "prediction", "forecast", "gating", "covariates",),
     verbose=False,
@@ -330,6 +386,30 @@ def setup_muon_optimizer(
             nesterov=muon_nesterov, ns_coefficients=muon_ns_coefficients, eps=muon_eps,
             ns_steps=muon_ns_steps, adjust_lr_fn=muon_adjust_lr_fn,
         )
+    # Muon and AdamW share one schedule shape; their magnitudes come from each group's own base LR.
+    # Sharing the same base is only meaningful when Muon's update is rescaled to AdamW's RMS as an
+    # orthogonalized update has RMS 1/sqrt(max(m,n)): ~45x smaller than AdamW's at the same lr for
+    # a 2048x1024 matrix. torch.optim.Muon defaults adjust_lr_fn=None, which maps to "original".
+    if (muon_optimizer is not None) and (adamw_optimizer is not None) \
+            and (muon_adjust_lr_fn != "match_rms_adamw") and (muon_lr_scale == 1.0):
+        raise ValueError(
+            f"adjust_lr_fn={muon_adjust_lr_fn!r} does not match Muon's update RMS to AdamW's, so the "
+            f"two cannot share a base learning rate. Use adjust_lr_fn='match_rms_adamw', or pass an "
+            f"explicit muon_lr_scale (typically 10-50x)."
+        )
+    if (muon_optimizer is not None) and (muon_adjust_lr_fn == "match_rms_adamw") and (muon_lr_scale != 1.0):
+        warnings.warn(
+            f"adjust_lr_fn='match_rms_adamw' already rescales Muon's update to AdamW's RMS "
+            f"(x0.2*sqrt(max(m,n))); muon_lr_scale={muon_lr_scale} is applied on top of it. That is a "
+            f"deliberate ratio only if you intend it -- passing sqrt(d_ff) here would apply the RMS "
+            f"correction twice.", stacklevel=2
+        )
+    # the per-group base LR is the single source of truth: CosineLRDecay and every
+    # torch.optim.lr_scheduler read it as 'initial_lr'
+    if (muon_optimizer is not None) and (muon_lr_scale != 1.0):
+        for group in muon_optimizer.param_groups:
+            group["lr"]= learning_rate * muon_lr_scale
+
     # AdamW is the first in order to get param_groups[0]["betas"]
     optimizer= MultiOptimizer(adamw=adamw_optimizer, muon=muon_optimizer)
 
