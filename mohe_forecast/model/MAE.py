@@ -77,13 +77,13 @@ class MohetsMAE(nn.Module):
     def mask_ratio(self) -> float:
         """
         The mask ratio currently held by the encoder's masking layer.
-        NOTE: forward(ts, mask_ratio=0.75, ...) calls set_mask_ratio() on every pass, so this value
-        reflects the last forward. Always pass mask_ratio explicitly rather than relying on the default.
+        NOTE: forward(ts, mask_ratio, ...) calls set_mask_ratio() on every pass, so this value reflects 
+        the last forward. Always pass mask_ratio explicitly rather than relying on the default.
         """
         return float(self.mask_layer.mask_ratio)
 
 
-    def set_mask_ratio(self, mask_ratio=0.75) -> None:
+    def set_mask_ratio(self, mask_ratio) -> None:
         assert 0.0 <= mask_ratio < 1.0, "mask_ratio must be in [0, 1)"
         self.mask_layer.mask_ratio= float(mask_ratio)
 
@@ -108,20 +108,27 @@ class MohetsMAE(nn.Module):
         return x
 
 
-    def patch_stats(self, ts):
+    @staticmethod
+    def local_norm(ts, eps:float=1e-6):
+        """ Norm computed inline with local stats. """
+        p_mean = ts.mean(dim=-1, keepdim=True)
+        p_stdev= torch.sqrt(ts.var(dim=-1, keepdim=True, unbiased=False) + eps)
+        ts_norm= (ts - p_mean) / p_stdev
+
+        return ts_norm
+
+
+    def patch_stats(self, ts, eps:float=1e-6):
         """
-        Per-patch mean / stdev of the RAW series: exactly the statistics forward_loss uses to build the
+        Per-patch mean / stdev of the raw series: exactly the statistics forward_loss uses to build the
         norm_pix target (same eps, same unbiased=False), so a reconstruction can be mapped back to the
         original units without duplicating (and drifting from) that math.
         ts:     (B, C, T)
         p_mean: (B*C, P, 1), p_stdev: (B*C, P, 1)
         """
-        assert self.input_norm is not None, \
-            "patch_stats is only meaningful when input_norm is enabled (norm_pix targets)"
-
-        target= self.patchify(ts)
+        target = self.patchify(ts)
         p_mean = target.mean(dim=-1, keepdim=True)
-        p_stdev= torch.sqrt(target.var(dim=-1, keepdim=True, unbiased=False) + self.input_norm.eps)
+        p_stdev= torch.sqrt(target.var(dim=-1, keepdim=True, unbiased=False) + eps)
 
         return p_mean, p_stdev
 
@@ -196,15 +203,18 @@ class MohetsMAE(nn.Module):
         ts_pred: (BC, P, patch_width)
         mask: (BC, P) -> 0 is keep, 1 is removing
         """
+        # per-point target normalization computed with local stats
+        if self.input_norm is not None:
+            ts= self.local_norm(ts, eps=self.input_norm.eps)
+
         target= self.patchify(ts)
+
         # per-patch target normalization (norm_pix_loss, He et al. 2021). Computed inline with local stats
         # so it does not overwrite self.input_norm's encoder-input statistics (the [B, C, 1] stats stored
         # during forward_encoder, which unpatchify/denorm rely on). This is numerically identical to the
-        # previous self.input_norm(target, 'norm') call (per-patch mean, biased variance, eps inside the sqrt)
-        if self.input_norm is not None:
-            p_mean = target.mean(dim=-1, keepdim=True)
-            p_stdev= torch.sqrt(target.var(dim=-1, keepdim=True, unbiased=False) + self.input_norm.eps)
-            target = (target - p_mean) / p_stdev
+        # previous self.input_norm(target, 'norm') call.
+        if self.input_norm is None:
+            target= self.local_norm(target, eps=1e-6)
 
         loss= (ts_pred - target)**2 if criterion is None else criterion(ts_pred, target)
         loss= loss.mean(dim=-1)  # (BC, P) mean loss per patch

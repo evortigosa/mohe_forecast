@@ -179,7 +179,7 @@ class LoadBalancingLoss:
 
 class LayerwiseLoadBalancingLoss(LoadBalancingLoss):
     """
-    Auxiliary load-balancing (anti-collapse) loss for Seg-MoE, computed per layer and
+    Auxiliary load-balancing (anti-collapse) loss for MoHE, computed per layer and
     averaged over layers.
     """
 
@@ -216,7 +216,7 @@ class LayerwiseLoadBalancingLoss(LoadBalancingLoss):
     def __call__(self, router_probs, padding_mask=None, return_metrics=False, valid_masks=None):
         """
         - router_probs: list of per-layer router probabilities (softmax over experts), one entry
-        per Seg-MoE layer, each [B*Segs, N] (mode='layer') or [B', Segs, N] (either mode).
+        per MoHE layer, each [B*Segs, N] (mode='layer') or [B', Segs, N] (either mode).
         Entries may be None for non-MoE layers.
         - padding_mask: kept for interface compatibility; must be None in this version (segment
         padding is handled via valid_masks, not a data-validity mask).
@@ -235,7 +235,7 @@ class LayerwiseLoadBalancingLoss(LoadBalancingLoss):
         if not isinstance(router_probs, (list, tuple)) or all(p is None for p in router_probs):
             return 0.0, None, None
 
-        # average the per-layer Switch term over all Seg-MoE layers
+        # average the per-layer Switch term over all MoHE layers
         terms= []
         for i, probs in enumerate(router_probs):
             if probs is None:
