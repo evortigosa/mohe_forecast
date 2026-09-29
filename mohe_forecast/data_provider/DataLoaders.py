@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
 from datasetsforecast.long_horizon import LongHorizon
+from datasetsforecast.long_horizon2 import LongHorizon2
 from .TimeFeature import time_features
 
 
@@ -20,6 +21,10 @@ def load_data(name, unique_id=None):
     Load ETT, Weather, or Traffic datasets via neuralforecast's LongHorizon, pivot it to wide format,
     optionally sub-select unique_id series, and return the combined DataFrame plus metadata.
     """
+    def _load_etth(group):
+        out = LongHorizon2.load(directory='./', group=group)
+        return out[0] if isinstance(out, tuple) else out
+
     name= name.lower()
     # name in {'ettm1','ettm2','etth1','etth2'}
     if name == 'ettm1':
@@ -30,9 +35,9 @@ def load_data(name, unique_id=None):
     elif name == 'ettm2':
         Y_df, X_df, *_= LongHorizon.load(directory='./', group='ETTm2')
     elif name == 'etth1':
-        Y_df, X_df, *_= LongHorizon.load(directory='./', group='ETTh1')
+        Y_df= _load_etth('ETTh1')
     elif name == 'etth2':
-        Y_df, X_df, *_= LongHorizon.load(directory='./', group='ETTh2')
+        Y_df= _load_etth('ETTh2')
     elif name == 'weather':
         Y_df, X_df, *_= LongHorizon.load(directory='./', group='Weather')
     elif name == 'traffic':
@@ -44,7 +49,7 @@ def load_data(name, unique_id=None):
 
     # pivot Y_df to wide format: index=ds, columns=unique_id, values=y
     df= (
-        Y_df
+        Y_df[['ds', 'unique_id', 'y']]
         .assign(ds= lambda d: pd.to_datetime(d['ds']))  # ensure datetime in 'ds'
         .pivot(index='ds', columns='unique_id', values='y')
         .rename_axis(columns=None)                      # drop the name 'unique_id'
